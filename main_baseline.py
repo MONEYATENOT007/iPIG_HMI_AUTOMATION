@@ -1,0 +1,4962 @@
+# file: multi_board_sd_automation_gui.py
+# Requires: PyQt5, pyserial, psutil, tqdm
+# Persisted config: boards_config.json (serial->name,type,exclude,total_slots map)
+
+import os
+import sys
+import time
+import json
+import shutil
+import subprocess
+import serial
+import serial.tools.list_ports
+from serial import SerialException
+from tqdm import tqdm
+import psutil
+import ctypes
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+import atexit
+import traceback
+from datetime import datetime
+import re
+from typing import Optional, Dict, Set, List, Tuple
+
+# ---------------------------- CONFIG PATH ----------------------------
+def get_config_path() -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "boards_config.json")
+
+CONFIG_PATH = get_config_path()
+
+def load_registry() -> Dict[str, Dict]:
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "serial_to_board" in data:
+                    return data
+    except Exception:
+        pass
+    return {"version": 4, "serial_to_board": {}}  # v2 adds "exclude", v3 adds "pipe_size", v4 adds "total_slots"
+
+def save_registry(reg: Dict[str, Dict]) -> None:
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reg, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        try:
+            if os.path.exists(CONFIG_PATH):
+                shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
+        except Exception:
+            pass
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        print(f"[WARN] Failed to save registry: {e}", flush=True)
+
+REGISTRY = load_registry()
+
+# ---------------------------- RESOURCES ----------------------------
+def resource_path(relative_path: str) -> str:
+    """
+    Resolve a resource path for both source and frozen (PyInstaller) modes.
+    Preference order:
+      1) Next to the executable (for frozen) or CWD (for source)
+      2) PyInstaller _MEIPASS unpack directory (if present)
+    This allows keeping firmware/config outside the EXE while still supporting
+    older bundles that ship them inside _MEIPASS.
+    """
+    base_candidates: List[str] = []
+    if getattr(sys, "frozen", False):
+        # Prefer files next to the executable when frozen
+        base_candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
+    # Also consider current working directory
+    base_candidates.append(os.path.abspath("."))
+    # Finally, consider the PyInstaller unpack directory if available
+    if hasattr(sys, "_MEIPASS"):
+        base_candidates.append(getattr(sys, "_MEIPASS"))
+
+    for base in base_candidates:
+        candidate = os.path.join(base, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Fallback: first base + relative path
+    if base_candidates:
+        return os.path.join(base_candidates[0], relative_path)
+    return relative_path
+
+DATA_FIRMWARE = resource_path("firmware/DATA.uf2")
+EGP_FIRMWARE  = resource_path("firmware/EGP.uf2")
+MFL_FIRMWARE  = resource_path("firmware/MFL.uf2")
+CMFL_FIRMWARE = resource_path("firmware/CMFL.uf2")
+
+# ---------------------------- GLOBALS ----------------------------
+RUN_START = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+MAX_LABEL_LEN = 11
+
+MODE_CURRENT: Optional[str] = None
+BOARD_PORTS_CURRENT: Dict[str, str] = {}        # board_name -> COMx
+BOARD_TYPES_CURRENT: Dict[str, str] = {}        # board_name -> type key
+BOARD_EXCLUDE_SLOTS: Dict[str, Set[int]] = {}   # board_name -> excluded slots from registry
+BOARD_PIPE_SIZES: Dict[str, int] = {}           # board_name -> pipe size in inches
+BOARD_TOTAL_SLOTS_CURRENT: Dict[str, int] = {}  # board_name -> total slots from registry
+DETECTED_SERIALS_CURRENT: Set[str] = set()      # usb serial numbers currently detected
+RUN_SELECTION: Optional[Dict[str, Set[int]]] = None
+SENSOR_CHECK_SAFELOCK_PORTS: Set[str] = set()
+
+BOARD_SLOT_LIMITS = {"A-MFL": 5, "C-MFL": 8, "EGP": 5}
+SENSOR_CHECK_SAMPLE_SECONDS = 5.0
+SENSOR_CHECK_PORT_APPEAR_SECONDS = 3.0
+SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS = 0.75
+SENSOR_CHECK_BETWEEN_SLOTS_SECONDS = 1.5
+SENSOR_CHECK_EXPECTED_TMAGS = tuple(range(8))
+TMAG_LINE_RE = re.compile(
+    r"\btmag\s*([0-7])\b.*?\bx\s*[:=]?\s*(-?\d+(?:\.\d+)?).*?\by\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+MT_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*mT\b", re.IGNORECASE)
+ANGLE_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:\u00b0|deg(?:ree)?s?)", re.IGNORECASE)
+
+PROG_TOTAL_SLOTS = 0
+PROG_SLOTS_DONE: Set[Tuple[str, int]] = set()
+
+# Dead ports/boards (with 5s grace on first failure)
+DEAD_PORTS: Set[str] = set()
+DEAD_BOARDS: Set[str] = set()
+_DEAD_LOCK = threading.RLock()
+
+# Cancel control
+CANCEL_EVENT = threading.Event()
+
+# File selection config (data extraction)
+FILE_SLICE_LOCK = threading.RLock()
+FILE_SLICE_CONFIG = {"enabled": False, "offset": 0, "count": 0, "tail": 0}
+
+def set_file_slice_config(enabled: bool, offset: int, count: int, tail: int) -> None:
+    """Persist the current custom file selection settings (thread-safe)."""
+    with FILE_SLICE_LOCK:
+        FILE_SLICE_CONFIG["enabled"] = bool(enabled)
+        FILE_SLICE_CONFIG["offset"] = max(0, int(offset or 0))
+        FILE_SLICE_CONFIG["count"] = max(0, int(count or 0))
+        FILE_SLICE_CONFIG["tail"] = max(0, int(tail or 0))
+
+def get_file_slice_config() -> Dict[str, int]:
+    with FILE_SLICE_LOCK:
+        return dict(FILE_SLICE_CONFIG)
+
+def _norm_port(port_name: str) -> str:
+    return (port_name or "").strip().upper()
+
+def reset_dead_state() -> None:
+    with _DEAD_LOCK:
+        DEAD_PORTS.clear()
+        DEAD_BOARDS.clear()
+
+def is_board_dead(board: str) -> bool:
+    with _DEAD_LOCK:
+        return board in DEAD_BOARDS
+
+def mark_port_dead(port: str, reason: str = "") -> None:
+    portn = _norm_port(port)
+    if not portn:
+        return
+    with _DEAD_LOCK:
+        if portn in DEAD_PORTS:
+            return
+        DEAD_PORTS.add(portn)
+        boards = [b for b, p in BOARD_PORTS_CURRENT.items() if _norm_port(p) == portn]
+        for b in boards:
+            if b not in DEAD_BOARDS:
+                DEAD_BOARDS.add(b)
+                log(f"[{b}] Marked DEAD (port {portn}): {reason or 'serial disconnect'}")
+
+def port_exists_now(port_name: str) -> bool:
+    target = _norm_port(port_name)
+    if not target:
+        return False
+    for p in serial.tools.list_ports.comports():
+        if _norm_port(p.device) == target:
+            return True
+    return False
+
+def wait_for_port_back(port_name: str, timeout_sec: float = 5.0, interval: float = 0.25) -> bool:
+    end = time.time() + max(0.0, timeout_sec)
+    while time.time() < end:
+        if port_exists_now(port_name):
+            return True
+        time.sleep(interval)
+    return False
+
+# ---------------------------- STATUS TRACKER ----------------------------
+class StatusTracker:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.data: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
+
+    def clear(self):
+        with self._lock:
+            self.data.clear()
+
+    def _ensure(self, board: str, slot: int, phase: str) -> None:
+        s = str(slot)
+        with self._lock:
+            self.data.setdefault(board, {})
+            self.data[board].setdefault(s, {})
+            self.data[board][s].setdefault(phase, {"status": "pending", "err": ""})
+
+    def mark(self, board: str, slot: int, phase: str, status: str, err: str = "") -> None:
+        self._ensure(board, slot, phase)
+        with self._lock:
+            self.data[board][str(slot)][phase]["status"] = status
+            self.data[board][str(slot)][phase]["err"] = err
+
+    def update_phase_fields(self, board: str, slot: int, phase: str, fields: Dict[str, object]) -> None:
+        self._ensure(board, slot, phase)
+        with self._lock:
+            self.data[board][str(slot)][phase].update(fields)
+
+    def snapshot(self) -> Dict[str, Dict[str, Dict[str, Dict[str, str]]]]:
+        with self._lock:
+            return json.loads(json.dumps(self.data))
+
+    @staticmethod
+    def slot_done(option_mode: str, phases: Dict[str, Dict[str, str]]) -> bool:
+        g = lambda k: (phases.get(k, {}) or {}).get("status", "")
+        if option_mode in ("DATA", "DATA_PREF", "DATA_LOG", "DATA_LOG_PREF"):
+            return g("copy") == "success"
+        if option_mode in ("MFL", "MFL_PREF"):
+            return g("format") == "success"
+        if option_mode in ("MFL_ALL_SLOTS", "CMFL_ALL_SLOTS", "EGP_ALL_SLOTS"):
+            return g("mfl_upload") == "success"
+        if option_mode == "UPLOAD_CODE":
+            return g("mfl_upload") == "success"
+        if option_mode in ("CHECK_SENSOR_MFL_CMFL", "CHECK_SENSOR_EGP"):
+            return g("sensor_check") == "success"
+        if option_mode == "AUTO_FORMAT_BURN":
+            return g("format") == "success" and g("mfl_upload") == "success"
+        if option_mode == "AUTO_FORMAT_BURN_EGP":
+            return g("format") == "success" and g("mfl_upload") == "success"
+        if option_mode == "LABEL":
+            return g("label") == "success"
+        if option_mode in ("ODO", "INLB"):
+            return g("special") == "success"
+        return False
+
+    def summarize(self, option_mode: str) -> Dict[str, object]:
+        snap = self.snapshot()
+        boards_total = len(snap)
+        slots_total  = sum(len(slots) for slots in snap.values())
+        slots_ok = 0
+        failures: List[Tuple[str, int, str]] = []
+        boards_ok: Set[str] = set()
+        boards_fail: Set[str] = set()
+
+        for b, slots in snap.items():
+            board_all_ok = True
+            for s, phases in slots.items():
+                if self.slot_done(option_mode, phases):
+                    slots_ok += 1
+                else:
+                    board_all_ok = False
+                    reasons = []
+                    for ph, rec in phases.items():
+                        if rec.get("status") == "failed":
+                            reasons.append(f"{ph}: {rec.get('err') or 'failed'}")
+                    if not reasons:
+                        reasons.append("incomplete")
+                    try:
+                        s_int = int(s)
+                    except Exception:
+                        s_int = 0
+                    failures.append((b, s_int, "; ".join(reasons)))
+            if board_all_ok and slots:
+                boards_ok.add(b)
+            else:
+                boards_fail.add(b)
+
+        return {
+            "boards_total": boards_total,
+            "boards_ok": len(boards_ok),
+            "boards_fail": len(boards_fail - boards_ok),
+            "slots_total": slots_total,
+            "slots_ok": slots_ok,
+            "slots_fail": slots_total - slots_ok,
+            "failures": failures
+        }
+
+TRACKER = StatusTracker()
+
+# ---------------------------- LOGGING ----------------------------
+LOG_DIR = os.path.join(os.path.abspath("."), "Extracted_Data")
+os.makedirs(LOG_DIR, exist_ok=True)
+RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+TIMESTAMPED_LOG = os.path.join(LOG_DIR, f"log_{RUN_TS}.txt")
+LATEST_LOG      = os.path.join(LOG_DIR, "log_latest.txt")
+SIMPLE_LOG      = os.path.join(LOG_DIR, f"simple_log_{RUN_TS}.txt")
+
+_logger = logging.getLogger("mbsd")
+_logger.setLevel(logging.INFO)
+_handler_ts = logging.FileHandler(TIMESTAMPED_LOG, encoding="utf-8")
+_handler_ts.setLevel(logging.INFO)
+_handler_ts.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_logger.addHandler(_handler_ts)
+_handler_latest = logging.FileHandler(LATEST_LOG, encoding="utf-8")
+_handler_latest.setLevel(logging.INFO)
+_handler_latest.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_logger.addHandler(_handler_latest)
+_logger.propagate = False
+
+def _flush_logs() -> None:
+    for h in list(_logger.handlers):
+        try:
+            h.flush()
+        except Exception:
+            pass
+atexit.register(_flush_logs)
+
+def _excepthook(exc_type, exc, tb):
+    try:
+        _logger.error("UNCAUGHT EXCEPTION:\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
+        _logger.error("STATE SNAPSHOT (on crash): %s", json.dumps(TRACKER.snapshot(), indent=2))
+        _flush_logs()
+        try:
+            update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
+        except Exception:
+            pass
+    finally:
+        sys.__excepthook__(exc_type, exc, tb)
+sys.excepthook = _excepthook
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+    _logger.info(msg)
+    _flush_logs()
+    try:
+        from PyQt5.QtCore import QCoreApplication
+        if QCoreApplication.instance() is not None:
+            QCoreApplication.postEvent(QtLogBridge.instance(), QtLogEvent(msg))
+    except Exception:
+        pass
+
+# ---------------------------- SIMPLE LOG ----------------------------
+def update_simple_log(board_ports: Dict[str, str], option_mode: Optional[str]) -> None:
+    if not option_mode:
+        return
+    snap = TRACKER.snapshot()
+    lines: List[str] = []
+    lines.append(f"simple_log | option={option_mode} | started={RUN_START} | now={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    boards = list(board_ports.keys())
+    try:
+        boards = sorted(boards, key=lambda n: (board_index(n), n))
+    except Exception:
+        pass
+
+    with _DEAD_LOCK:
+        dead_boards = set(DEAD_BOARDS)
+
+    expected_slots = sum(get_slot_limit(b) for b in boards)
+    for b in boards:
+        prefix = "[DEAD] " if b in dead_boards else ""
+        slots = []
+        lim = get_slot_limit(b)
+        for s in range(1, lim + 1):
+            phases = snap.get(b, {}).get(str(s), {})
+            done = StatusTracker.slot_done(option_mode, phases if isinstance(phases, dict) else {})
+            suffix = ""
+            if option_mode in ("CHECK_SENSOR_MFL_CMFL", "CHECK_SENSOR_EGP"):
+                rec = (phases.get("sensor_check", {}) or {}) if isinstance(phases, dict) else {}
+                tmag_status = rec.get("tmag_status") if isinstance(rec, dict) else None
+                if isinstance(tmag_status, dict) and tmag_status:
+                    parts = []
+                    if option_mode == "CHECK_SENSOR_EGP":
+                        names = sorted(
+                            tmag_status.keys(),
+                            key=lambda n: int(re.search(r"\d+", n).group(0)) if re.search(r"\d+", n) else 0,
+                        )
+                    else:
+                        names = [f"tmag{idx}" for idx in SENSOR_CHECK_EXPECTED_TMAGS]
+                    for name in names:
+                        item = tmag_status.get(name, {}) or {}
+                        label = name.upper().replace("TMAG", "T")
+                        parts.append(f"{label}={'OK' if item.get('ok') else 'BAD'}")
+                    suffix = "(" + ",".join(parts) + ")"
+                elif rec.get("err"):
+                    suffix = f"({rec.get('err')})"
+            slots.append(f"{s}={'True' if done else 'False'}{suffix}")
+        lines.append(f"{prefix}{b}({get_board_type(b)}): " + ("  ".join(slots) if slots else "(no slots)"))
+
+    summary = TRACKER.summarize(option_mode)
+    dead_list = ", ".join(sorted(dead_boards, key=lambda n: (board_index(n), n))) if dead_boards else "-"
+    lines.append(
+        "TOTALS: "
+        f"boards_detected={summary['boards_total']} "
+        f"slots_expected={expected_slots} "
+        f"| boards_ok={summary['boards_ok']} boards_fail={summary['boards_fail']} "
+        f"| slots_seen={summary['slots_total']} slots_ok={summary['slots_ok']} slots_fail={summary['slots_fail']} "
+        f"| boards_dead={len(dead_boards)} [{dead_list}]"
+    )
+    with open(SIMPLE_LOG, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+# ---------------------------- PROGRESS ----------------------------
+def _is_slot_processed(mode: Optional[str], phases: Dict[str, Dict[str, str]]) -> bool:
+    return StatusTracker.slot_done(mode or "", phases)
+
+def _bump_progress_if_terminal(board: str, slot: int):
+    global PROG_SLOTS_DONE
+    phases = TRACKER.snapshot().get(board, {}).get(str(slot), {})
+    if _is_slot_processed(MODE_CURRENT, phases):
+        key = (board, int(slot))
+        if key not in PROG_SLOTS_DONE:
+            PROG_SLOTS_DONE.add(key)
+
+def mark_and_update(board: str, slot: int, phase: str, status: str, err: str = "") -> None:
+    TRACKER.mark(board, slot, phase, status, err)
+    try:
+        _bump_progress_if_terminal(board, slot)
+        update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
+    except Exception:
+        pass
+
+def mark_sensor_check(
+    board: str,
+    slot: int,
+    status: str,
+    err: str = "",
+    tmag_status: Optional[Dict[str, Dict[str, object]]] = None,
+) -> None:
+    TRACKER.mark(board, slot, "sensor_check", status, err)
+    if tmag_status is not None:
+        TRACKER.update_phase_fields(board, slot, "sensor_check", {"tmag_status": tmag_status})
+    try:
+        _bump_progress_if_terminal(board, slot)
+        update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
+    except Exception:
+        pass
+
+def set_progress_total_from_selected(selected_boards: List[Tuple[str, str]], selection: Optional[Dict[str, Set[int]]]) -> None:
+    global PROG_TOTAL_SLOTS, PROG_SLOTS_DONE
+    if selection:
+        total = 0
+        for b, _ in selected_boards:
+            lim = get_slot_limit(b)
+            total += len([s for s in selection.get(b, set()) if 1 <= int(s) <= lim])
+        PROG_TOTAL_SLOTS = max(1, total)
+    else:
+        PROG_TOTAL_SLOTS = max(1, sum(get_slot_limit(b) for b, _ in selected_boards))
+    PROG_SLOTS_DONE = set()
+
+def start_new_run_reset():
+    TRACKER.clear()
+    reset_dead_state()
+    CANCEL_EVENT.clear()
+
+# ---------------------------- HELPERS ----------------------------
+def board_index(board_name: str) -> int:
+    m = re.search(r"(\d+)$", board_name or "")
+    return int(m.group(1)) if m else 0
+
+def board_name_from_index(idx: int) -> str:
+    return f"Board_{idx}"
+
+def build_label(mode: str, bidx: int, slot: int) -> str:
+    mu = (mode or "").upper()
+    if mu == "EGP":
+        prefix = "EGP"
+    elif mu == "CMFL":
+        prefix = "CMFL"
+    else:
+        prefix = "MFL"
+    raw = f"{prefix}B{bidx}S{slot}".upper()
+    cleaned = re.sub(r"[^A-Z0-9 ]", "", raw)
+    label = cleaned[:MAX_LABEL_LEN]
+    if label != raw:
+        log(f"[LABEL] Compacting '{raw}' -> '{label}' for exFAT")
+    return label
+
+def parse_compact_label(lbl: str) -> Optional[Tuple[str, int, int]]:
+    if not lbl:
+        return None
+    m = re.match(r"^(MFL|EGP|CMFL)B(\d+)S(\d+)$", lbl.strip().upper())
+    if not m:
+        return None
+    try:
+        return (m.group(1), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+def get_board_type(board_name: str) -> str:
+    t = BOARD_TYPES_CURRENT.get(board_name)
+    return t if t in BOARD_SLOT_LIMITS else "C-MFL"
+
+def default_total_slots_for_type(board_type: str) -> int:
+    return BOARD_SLOT_LIMITS.get((board_type or "").strip().upper(), 8)
+
+def get_board_label_prefix(board_name: str) -> str:
+    t = get_board_type(board_name).upper()
+    if t == "EGP":
+        return "EGP"
+    if t == "C-MFL":
+        return "CMFL"
+    return "MFL"
+
+def get_slot_limit(board_name: str) -> int:
+    # ODO/INLB are slot-less
+    if (board_name or "").strip().upper() in {"ODO", "INLB"}:
+        return 0
+    slots = BOARD_TOTAL_SLOTS_CURRENT.get(board_name)
+    if slots in (5, 8):
+        return slots
+    return default_total_slots_for_type(get_board_type(board_name))
+
+def find_board_name_by_index(idx: int) -> str:
+    target_default = f"Board_{idx}"
+    if target_default in BOARD_PORTS_CURRENT:
+        return target_default
+    for name in BOARD_PORTS_CURRENT.keys():
+        if board_index(name) == idx:
+            return name
+    for name in BOARD_TYPES_CURRENT.keys():
+        if board_index(name) == idx:
+            return name
+    return target_default
+
+def find_named_board(exact_name: str) -> Optional[Tuple[str, str]]:
+    n = (exact_name or "").strip()
+    if not n:
+        return None
+    for k, v in BOARD_PORTS_CURRENT.items():
+        if k.strip() == n:
+            return (k, v)
+    return None
+
+def enter_sd_menu(port: str, board: str) -> bool:
+    resp = send_command(port, "2")
+    if resp is None:
+        log(f"[{board}] Failed to enter SD menu (cmd=2).")
+        return False
+    return True
+
+def enter_pref_mode89_menu(port: str, board: str) -> bool:
+    total_slots = get_slot_limit(board)
+    slot_cfg_cmd = "36" if total_slots == 8 else "33" if total_slots == 5 else None
+    if slot_cfg_cmd is None:
+        log(f"[{board}] Invalid total slots '{total_slots}' for preferred mode 8/9 flow.")
+        return False
+    for cmd in ("0", "1", slot_cfg_cmd, "0", "2"):
+        if send_command(port, cmd) is None:
+            log(f"[{board}] Failed during preferred mode 8/9 setup (cmd={cmd}).")
+            return False
+        time.sleep(0.2)
+    return True
+
+# ---------------------------- DETECTION ----------------------------
+def detect_boards() -> Dict[str, str]:
+    serial_to_board = REGISTRY.get("serial_to_board", {})
+    board_ports: Dict[str, str] = {}
+    board_types: Dict[str, str] = {}
+    board_excl: Dict[str, Set[int]] = {}
+    board_pipe_sizes: Dict[str, int] = {}
+    board_total_slots: Dict[str, int] = {}
+    detected_serials: Set[str] = set()
+
+    for port in serial.tools.list_ports.comports():
+        serial_number = getattr(port, "serial_number", None)
+        if not serial_number:
+            continue
+        if serial_number in serial_to_board:
+            entry = serial_to_board[serial_number] or {}
+            name = entry.get("name") or f"Board_{serial_number[-4:]}"
+            btype = (entry.get("type") or "C-MFL").upper()
+            pipe_raw = entry.get("pipe_size", "")
+            try:
+                pipe_size = int(pipe_raw)
+            except Exception:
+                pipe_size = 0
+            total_slots_raw = entry.get("total_slots", default_total_slots_for_type(btype))
+            try:
+                total_slots = int(total_slots_raw)
+            except Exception:
+                total_slots = default_total_slots_for_type(btype)
+            if total_slots not in (5, 8):
+                total_slots = default_total_slots_for_type(btype)
+            exclude_raw = entry.get("exclude", [])
+            try:
+                if isinstance(exclude_raw, str):
+                    exclude = {int(x) for x in re.split(r"[,\s]+", exclude_raw) if x.strip().isdigit()}
+                elif isinstance(exclude_raw, list):
+                    exclude = {int(x) for x in exclude_raw if isinstance(x, int) or (isinstance(x, str) and x.isdigit())}
+                else:
+                    exclude = set()
+            except Exception:
+                exclude = set()
+            detected_serials.add(serial_number)
+            board_ports[name] = port.device
+            board_types[name] = btype if btype in BOARD_SLOT_LIMITS else "C-MFL"
+            board_excl[name] = exclude
+            board_pipe_sizes[name] = pipe_size
+            board_total_slots[name] = total_slots
+
+    global BOARD_TYPES_CURRENT, BOARD_EXCLUDE_SLOTS, BOARD_PIPE_SIZES, BOARD_TOTAL_SLOTS_CURRENT, DETECTED_SERIALS_CURRENT
+    BOARD_TYPES_CURRENT = board_types
+    BOARD_EXCLUDE_SLOTS = board_excl
+    BOARD_PIPE_SIZES = board_pipe_sizes
+    BOARD_TOTAL_SLOTS_CURRENT = board_total_slots
+    DETECTED_SERIALS_CURRENT = detected_serials
+    log(f"[INFO] Detected boards (registry-based): {board_ports}")
+    return board_ports
+
+def get_port_for_board(board_name: str) -> Optional[str]:
+    port = BOARD_PORTS_CURRENT.get(board_name)
+    if not port:
+        refreshed = detect_boards()
+        port = refreshed.get(board_name)
+    return port
+
+# ---------------------------- SERIAL ----------------------------
+def send_command(port_name: str, cmd: str) -> Optional[str]:
+    if CANCEL_EVENT.is_set():
+        return None
+    try:
+        with serial.Serial(port_name, 115200, timeout=1) as ser:
+            ser.write((cmd + "\r\n").encode())
+            time.sleep(0.3)
+            resp = ser.read_all().decode(errors="ignore").strip()
+            log(f"[SERIAL {port_name}] > {cmd} | resp={resp[:80]}")
+            return resp
+    except (FileNotFoundError, SerialException) as e:
+        log(f"[WARN] Serial open failed on {port_name}: {e}. Waiting up to 5s for port to return...")
+        if wait_for_port_back(port_name, timeout_sec=5.0):
+            log(f"[INFO] Port {port_name} reappeared; retrying command.")
+            try:
+                with serial.Serial(port_name, 115200, timeout=1) as ser:
+                    ser.write((cmd + "\r\n").encode())
+                    time.sleep(0.3)
+                    resp = ser.read_all().decode(errors="ignore").strip()
+                    log(f"[SERIAL {port_name}] > {cmd} | resp={resp[:80]}")
+                    return resp
+            except Exception as e2:
+                mark_port_dead(port_name, f"retry after reappearance failed: {e2}")
+                log(f"[ERROR] Serial retry failed on {port_name}: {e2}")
+                return None
+        else:
+            mark_port_dead(port_name, str(e))
+            log(f"[ERROR] Serial communication failed on {port_name}: {e} (dead after 5s)")
+            return None
+    except Exception as e:
+        log(f"[ERROR] Serial communication failed on {port_name}: {e}")
+        return None
+
+def current_serial_devices() -> Set[str]:
+    return {_norm_port(p.device) for p in serial.tools.list_ports.comports() if getattr(p, "device", None)}
+
+def wait_for_new_serial_device(
+    before: Set[str],
+    timeout_sec: float = 8.0,
+    interval: float = 0.2,
+    exclude: Optional[Set[str]] = None,
+) -> Optional[str]:
+    end = time.time() + max(0.0, timeout_sec)
+    before_norm = {_norm_port(p) for p in before}
+    exclude_norm = {_norm_port(p) for p in (exclude or set())}
+    while time.time() < end:
+        if CANCEL_EVENT.is_set():
+            return None
+        now = current_serial_devices()
+        added = sorted(now - before_norm - exclude_norm)
+        if added:
+            return added[0]
+        time.sleep(interval)
+    return None
+
+def wait_for_serial_device_gone(port_name: str, timeout_sec: float = 3.0, interval: float = 0.2) -> bool:
+    target = _norm_port(port_name)
+    end = time.time() + max(0.0, timeout_sec)
+    while time.time() < end:
+        if target not in current_serial_devices():
+            return True
+        time.sleep(interval)
+    return target not in current_serial_devices()
+
+def _norm_sensor_value(value: str) -> str:
+    try:
+        return f"{float(value):.6g}"
+    except Exception:
+        return value.strip()
+
+def parse_tmag_values(line: str) -> Optional[Tuple[int, Tuple[str, ...]]]:
+    tmag_match = re.search(r"\btmag\s*([0-7])\b", line or "", re.IGNORECASE)
+    if tmag_match:
+        mt_values = tuple(_norm_sensor_value(v) for v in MT_VALUE_RE.findall(line or ""))
+        if mt_values:
+            return int(tmag_match.group(1)), mt_values
+
+    m = TMAG_LINE_RE.search(line or "")
+    if m:
+        return int(m.group(1)), (_norm_sensor_value(m.group(2)), _norm_sensor_value(m.group(3)))
+    return None
+
+def parse_tmag_angle_values(line: str) -> Optional[Tuple[int, Tuple[str, ...]]]:
+    tmag_match = re.search(r"\btmag\s*(\d+)\b", line or "", re.IGNORECASE)
+    if not tmag_match:
+        return None
+    angle_values = tuple(_norm_sensor_value(v) for v in ANGLE_VALUE_RE.findall(line or ""))
+    if not angle_values:
+        return None
+    return int(tmag_match.group(1)), angle_values
+
+def monitor_tmag_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAMPLE_SECONDS) -> Tuple[bool, Dict[str, Dict[str, object]], List[str]]:
+    samples: Dict[int, Set[Tuple[str, ...]]] = {i: set() for i in SENSOR_CHECK_EXPECTED_TMAGS}
+    raw_lines: List[str] = []
+    end = time.time() + max(0.1, sample_seconds)
+    try:
+        with serial.Serial(port_name, 115200, timeout=0.15) as ser:
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            while time.time() < end and not CANCEL_EVENT.is_set():
+                chunk = ser.readline()
+                if not chunk:
+                    continue
+                line = chunk.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if len(raw_lines) < 50:
+                    raw_lines.append(line)
+                parsed = parse_tmag_values(line)
+                if parsed:
+                    idx, values = parsed
+                    samples.setdefault(idx, set()).add(values)
+    except Exception as e:
+        detail = {
+            f"tmag{i}": {"ok": False, "samples": 0, "values": []}
+            for i in SENSOR_CHECK_EXPECTED_TMAGS
+        }
+        return False, detail, [f"monitor failed on {port_name}: {e}"]
+
+    detail: Dict[str, Dict[str, object]] = {}
+    all_ok = True
+    for i in SENSOR_CHECK_EXPECTED_TMAGS:
+        vals = sorted(samples.get(i, set()))
+        ok = len(vals) >= 2
+        all_ok = all_ok and ok
+        detail[f"tmag{i}"] = {
+            "ok": ok,
+            "samples": len(vals),
+            "values": [",".join(f"{item}mT" for item in v) for v in vals[:5]],
+        }
+    return all_ok, detail, raw_lines
+
+def monitor_tmag_angle_values(port_name: str, sample_seconds: float = SENSOR_CHECK_SAMPLE_SECONDS) -> Tuple[bool, Dict[str, Dict[str, object]], List[str]]:
+    samples: Dict[int, Set[Tuple[str, ...]]] = {}
+    raw_lines: List[str] = []
+    end = time.time() + max(0.1, sample_seconds)
+    try:
+        with serial.Serial(port_name, 115200, timeout=0.15) as ser:
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            while time.time() < end and not CANCEL_EVENT.is_set():
+                chunk = ser.readline()
+                if not chunk:
+                    continue
+                line = chunk.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if len(raw_lines) < 50:
+                    raw_lines.append(line)
+                parsed = parse_tmag_angle_values(line)
+                if parsed:
+                    idx, values = parsed
+                    samples.setdefault(idx, set()).add(values)
+    except Exception as e:
+        return False, {}, [f"monitor failed on {port_name}: {e}"]
+
+    detail: Dict[str, Dict[str, object]] = {}
+    all_ok = bool(samples)
+    for i in sorted(samples.keys()):
+        vals = sorted(samples.get(i, set()))
+        ok = len(vals) >= 2
+        all_ok = all_ok and ok
+        detail[f"tmag{i}"] = {
+            "ok": ok,
+            "samples": len(vals),
+            "values": [",".join(f"{item}deg" for item in v) for v in vals[:5]],
+        }
+    return all_ok, detail, raw_lines
+
+def sensor_slot_command(slot: int) -> str:
+    return str(int(slot) + 8)
+
+def sensor_recovery_firmware_for_board(board: str) -> Optional[str]:
+    btype = get_board_type(board).upper()
+    if btype == "A-MFL":
+        return MFL_FIRMWARE
+    if btype == "C-MFL":
+        return CMFL_FIRMWARE
+    if btype == "EGP":
+        return EGP_FIRMWARE
+    return None
+
+def sensor_check_excluded_ports() -> Set[str]:
+    if SENSOR_CHECK_SAFELOCK_PORTS:
+        return set(SENSOR_CHECK_SAFELOCK_PORTS)
+    return {_norm_port(p) for p in BOARD_PORTS_CURRENT.values()}
+
+def recover_sensor_slot_firmware(board: str, port: str, slot: int) -> bool:
+    uf2_path = sensor_recovery_firmware_for_board(board)
+    if not uf2_path:
+        mark_and_update(board, slot, "mfl_upload", "failed", f"no recovery firmware for {get_board_type(board)}")
+        return False
+    log(f"[{board}:{slot}] Recovery: burning {os.path.basename(uf2_path)} because sensor COM did not appear.")
+    with BOOT_LOCK:
+        return _boot_and_upload_uf2(port, slot, uf2_path, board, "mfl_upload")
+
+def disconnect_mux(port_name: str, board_name: str) -> None:
+    try:
+        log(f"[{board_name}] Sending MUX disconnect (25)")
+        send_command(port_name, "25")
+        time.sleep(0.7)
+    except Exception as e:
+        log(f"[{board_name}] [WARN] MUX disconnect failed: {e}")
+
+# ---------------------------- DRIVE + FS ----------------------------
+def get_drive_label(drive_letter: str) -> str:
+    buf = ctypes.create_unicode_buffer(1024)
+    try:
+        ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(drive_letter + "\\"), buf, ctypes.sizeof(buf), None, None, None, None, 0)
+        return buf.value
+    except Exception:
+        return ""
+
+def set_volume_label_win(drive_letter: str, new_label: str) -> bool:
+    try:
+        path = ctypes.c_wchar_p(drive_letter + "\\")
+        label = ctypes.c_wchar_p(new_label)
+        rc = ctypes.windll.kernel32.SetVolumeLabelW(path, label)
+        return rc != 0
+    except Exception:
+        return False
+
+def enforce_label(drive_letter: str, desired_label: str) -> bool:
+    before = (get_drive_label(drive_letter.strip("\\")) or "").strip()
+    if before.lower() == desired_label.lower():
+        log(f"[LABEL] Already set: {drive_letter}='{before}'")
+        return True
+    ok = set_volume_label_win(drive_letter.strip("\\"), desired_label)
+    after = (get_drive_label(drive_letter.strip("\\")) or "").strip()
+    if after.lower() == desired_label.lower():
+        log(f"[LABEL] Set OK: {drive_letter}='{after}' (was '{before or 'N/A'}')")
+        return True
+    log(f"[LABEL] Set FAILED: wanted '{desired_label}', got '{after or 'N/A'}'")
+    return False
+
+def get_fs_type_by_letter(drive_letter: str) -> str:
+    dl = drive_letter.strip("\\/:").upper() + ":\\"
+    for p in psutil.disk_partitions(all=False):
+        if p.device.upper() == dl:
+            return (p.fstype or "").strip()
+    return ""
+
+def _iter_removable_partitions():
+    """
+    Yield partitions, preferring those marked as removable.
+    Falls back to all partitions if no removable flag is present.
+    """
+    parts = list(psutil.disk_partitions(all=False))
+    removable = []
+    for p in parts:
+        try:
+            opts = (getattr(p, "opts", "") or "").lower()
+            if "removable" in opts:
+                removable.append(p)
+        except Exception:
+            continue
+    return removable or parts
+
+def wait_for_new_drive(
+    timeout: int = 40,
+    expect_bootloader: bool = True,
+    initial_state: Optional[Dict[str, str]] = None,
+    debug_tag: str = "",
+) -> Optional[str]:
+    if CANCEL_EVENT.is_set():
+        return None
+    start = time.time()
+    def label_of(dev: str) -> str:
+        try:
+            return get_drive_label(dev.strip("\\"))  # fast probe
+        except Exception:
+            return ""
+    if initial_state is None:
+        initial_state = {p.device: label_of(p.device) for p in _iter_removable_partitions()}
+    if debug_tag:
+        try:
+            log(f"[USB DEBUG {debug_tag}] old drives = {sorted(initial_state.keys())}")
+        except Exception:
+            pass
+    while time.time() - start < timeout:
+        if CANCEL_EVENT.is_set():
+            return None
+        current = {p.device: label_of(p.device) for p in _iter_removable_partitions()}
+        new_drives = set(current.keys()) - set(initial_state.keys())
+
+        if debug_tag:
+            try:
+                log(f"[USB DEBUG {debug_tag}] current drives = {sorted(current.keys())}")
+                if new_drives:
+                    log(f"[USB DEBUG {debug_tag}] new drives = {sorted(new_drives)}")
+            except Exception:
+                pass
+
+        for d in new_drives:
+            dp = f"{d}\\"
+            lbl = (current[d] or "").upper()
+            if expect_bootloader:
+                if "RPI-RP2" in lbl or os.path.exists(os.path.join(dp, "INFO_UF2.TXT")):
+                    log(f"[USB] New bootloader drive: {dp} ({lbl})")
+                    return dp
+            else:
+                if "RPI-RP2" not in lbl and "RP-DRIVE" not in lbl:
+                    log(f"[USB] New data drive: {dp} ({lbl})")
+                    return dp
+
+        for d, lbl in current.items():
+            prev = (initial_state.get(d, "") or "")
+            up = (lbl or "").upper()
+            prev_up = (prev or "").upper()
+            if expect_bootloader:
+                if ("RPI-RP2" in up and "RPI-RP2" not in prev_up) or os.path.exists(os.path.join(f"{d}\\", "INFO_UF2.TXT")):
+                    log(f"[USB] Bootloader appeared on existing device: {d}\\ ({up})")
+                    return f"{d}\\"
+            else:
+                # Special handling for LABEL_PREF: treat a label change to something
+                # like "Removable Disk" as a new SD, even if the drive letter was
+                # already present in the system.
+                if debug_tag.startswith("LABEL_PREF") and "REMOVABLE" in up and "REMOVABLE" not in prev_up:
+                    log(f"[USB] Removable data drive appeared on existing device: {d}\\ ({up}) [tag {debug_tag}]")
+                    return f"{d}\\"
+                if "RPI-RP2" not in up and "RP-DRIVE" not in up and "RPI-RP2" in prev_up:
+                    log(f"[USB] Data drive appeared after RP2: {d}\\ ({up})")
+                    return f"{d}\\"
+
+        time.sleep(0.5)
+    log("[USB] Timeout waiting for drive")
+    return None
+
+def wait_for_drive_by_label(expected_labels: List[str], timeout: int = 40) -> Optional[str]:
+    if CANCEL_EVENT.is_set():
+        return None
+    labels = [l.strip() for l in (expected_labels or []) if l and l.strip()]
+    labels_lc = {l.lower() for l in labels}
+    if not labels_lc:
+        return None
+    end = time.time() + timeout
+    while time.time() < end:
+        if CANCEL_EVENT.is_set():
+            return None
+        for p in _iter_removable_partitions():
+            root = p.device
+            try:
+                lbl = (get_drive_label(root.strip("\\")) or "").strip().lower()
+            except Exception:
+                lbl = ""
+            if lbl in labels_lc:
+                log(f"[USB] Matched label '{lbl}' at {root}")
+                return root if root.endswith("\\") else f"{root}\\"
+        time.sleep(0.3)
+    log(f"[USB] Timeout waiting for labels: {sorted(labels_lc)}")
+    return None
+
+# RPI-RP2 finder & uploader (Advanced)
+def list_rp2_drives() -> List[str]:
+    roots: List[str] = []
+    for p in psutil.disk_partitions(all=False):
+        root = p.device if p.device.endswith("\\") else f"{p.device}\\"
+        try:
+            lbl = (get_drive_label(root.strip("\\")) or "").upper()
+        except Exception:
+            lbl = ""
+        if "RPI-RP2" in lbl or os.path.exists(os.path.join(root, "INFO_UF2.TXT")):
+            roots.append(root)
+    return roots
+
+def upload_uf2_to_all_rp2(uf2_path: str) -> Tuple[int, int, List[str]]:
+    ok = 0; fail = 0; msgs: List[str] = []
+    if not os.path.isfile(uf2_path):
+        return 0, 0, [f"Firmware not found: {uf2_path}"]
+    drives = list_rp2_drives()
+    if not drives:
+        return 0, 0, ["No RPI-RP2 drives detected."]
+    for root in drives:
+        try:
+            shutil.copy2(uf2_path, os.path.join(root, os.path.basename(uf2_path)))
+            msgs.append(f"Copied to {root}")
+            ok += 1
+        except Exception as e:
+            msgs.append(f"Failed on {root}: {e}")
+            fail += 1
+    return ok, fail, msgs
+
+# ---------------------------- FILE COPY ----------------------------
+def copy_file_with_progress(src: str, dest: str, retries: int = 3, delay: float = 1.0) -> bool:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    for attempt in range(retries):
+        if CANCEL_EVENT.is_set():
+            return False
+        try:
+            total_size = os.path.getsize(src)
+            with open(src, "rb") as fsrc, open(dest, "wb") as fdst, tqdm(
+                total=total_size, unit="B", unit_scale=True,
+                desc=f"Copying {os.path.basename(src)}", ascii=True) as pbar:
+                while True:
+                    if CANCEL_EVENT.is_set():
+                        return False
+                    buf = fsrc.read(1024 * 1024)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    pbar.update(len(buf))
+            log(f"[COPIED] {src} -> {dest}")
+            return True
+        except Exception as e:
+            log(f"[ERROR] Copy failed ({attempt+1}/{retries}): {e}")
+            time.sleep(delay)
+    log(f"[ERROR] Failed to copy {src}")
+    return False
+
+def log_sdcard_file_info(src_drive: str, dest_folder: str, board: str, slot: int, vol_label: str) -> bool:
+    try:
+        if CANCEL_EVENT.is_set():
+            return False
+        if not os.path.exists(src_drive):
+            log(f"[LOG {board}:{slot}] Drive {src_drive} not found for logging.")
+            return False
+        file_map = top_level_file_map(src_drive)
+        if not file_map:
+            log(f"[LOG {board}:{slot}] No files found on {src_drive} to log.")
+            return False
+        os.makedirs(dest_folder, exist_ok=True)
+        log_path = os.path.join(dest_folder, "data_log.txt")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"=== DATA LOG | board={board} slot={slot} | "
+                f"label={vol_label or 'UNKNOWN'} | drive={src_drive} | time={ts} ===\n"
+            )
+            for name in sorted(file_map.keys()):
+                size = file_map.get(name, -1)
+                if size is None or size < 0:
+                    f.write(f"{name} | size=unknown\n")
+                else:
+                    f.write(f"{name} | {size} bytes\n")
+            f.write("\n")
+        log(f"[LOGGED] {board} slot {slot} | {len(file_map)} files from {src_drive} -> {log_path}")
+        return True
+    except Exception as e:
+        log(f"[ERROR] Failed to write data log for {board}:{slot}: {e}")
+        return False
+
+def top_level_file_map(root_path: str) -> Dict[str, int]:
+    try:
+        entries = os.listdir(root_path)
+    except Exception:
+        return {}
+    out: Dict[str, int] = {}
+    for name in entries:
+        p = os.path.join(root_path, name)
+        if os.path.isfile(p):
+            try:
+                out[name] = os.path.getsize(p)
+            except Exception:
+                out[name] = -1
+    return out
+
+def select_files_for_copy(files: List[str]) -> List[str]:
+    """Apply custom slice rules to the provided file list."""
+    cfg = get_file_slice_config()
+    ordered = sorted(files)
+    if not cfg.get("enabled"):
+        return ordered
+
+    offset = max(0, int(cfg.get("offset", 0) or 0))
+    count = max(0, int(cfg.get("count", 0) or 0))
+    tail = max(0, int(cfg.get("tail", 0) or 0))
+
+    window = ordered[offset: offset + count] if count > 0 else []
+    from_end = ordered[-tail:] if tail > 0 else []
+
+    seen: Set[str] = set()
+    selected: List[str] = []
+    for name in window + from_end:
+        if name in seen:
+            continue
+        selected.append(name)
+        seen.add(name)
+
+    log(f"[COPY] Custom selection enabled: skip={offset}, take={count}, tail={tail}, picked={len(selected)}/{len(ordered)}")
+    return selected
+
+def verify_top_level(src_drive: str, dest_folder: str, only_files: Optional[Set[str]] = None):
+    src_map = top_level_file_map(src_drive)
+    dest_map = top_level_file_map(dest_folder)
+    if only_files is not None:
+        src_map = {k: v for k, v in src_map.items() if k in only_files}
+        dest_map = {k: v for k, v in dest_map.items() if k in only_files}
+    missing = [f for f in src_map.keys() if f not in dest_map]
+    mismatched = [f for f in src_map.keys() if f in dest_map and dest_map[f] != src_map[f]]
+    return src_map, dest_map, missing, mismatched
+
+def copy_sdcard_files(src_drive: str, dest_folder: str, board: str, slot: int, max_passes: int = 3) -> bool:
+    try:
+        if CANCEL_EVENT.is_set():
+            mark_and_update(board, slot, "copy", "failed", "cancelled")
+            return False
+        mark_and_update(board, slot, "copy", "running", "")
+        label = (get_drive_label(src_drive.strip("\\")) or "").upper()
+        if "RPI-RP2" in label or "RP-DRIVE" in label:
+            mark_and_update(board, slot, "copy", "failed", "bootloader drive")
+            return False
+
+        if not os.path.exists(src_drive):
+            mark_and_update(board, slot, "copy", "failed", "drive not mounted")
+            return False
+
+        raw_files = [f for f in os.listdir(src_drive) if os.path.isfile(os.path.join(src_drive, f))]
+        files = select_files_for_copy(raw_files)
+        if not files:
+            reason = "no files after selection" if get_file_slice_config().get("enabled") else "no files"
+            mark_and_update(board, slot, "copy", "failed", reason)
+            return False
+
+        os.makedirs(dest_folder, exist_ok=True)
+        time.sleep(1.0)
+
+        for f in files:
+            if CANCEL_EVENT.is_set():
+                mark_and_update(board, slot, "copy", "failed", "cancelled")
+                return False
+            src_file = os.path.join(src_drive, f)
+            dest_file = os.path.join(dest_folder, f)
+            copy_file_with_progress(src_file, dest_file)
+
+        for _attempt in range(1, max_passes + 1):
+            if CANCEL_EVENT.is_set():
+                mark_and_update(board, slot, "copy", "failed", "cancelled")
+                return False
+            _, _, missing, mismatched = verify_top_level(src_drive, dest_folder, set(files))
+            if not missing and not mismatched:
+                mark_and_update(board, slot, "copy", "success", "")
+                return True
+            for f in missing + mismatched:
+                src_file = os.path.join(src_drive, f)
+                dest_file = os.path.join(dest_folder, f)
+                copy_file_with_progress(src_file, dest_file)
+            time.sleep(0.5)
+
+        _, _, missing, mismatched = verify_top_level(src_drive, dest_folder, set(files))
+        if not missing and not mismatched:
+            mark_and_update(board, slot, "copy", "success", "")
+            return True
+
+        reason = f"verify failed; missing={missing}, mismatched={mismatched}"
+        mark_and_update(board, slot, "copy", "failed", reason)
+        return False
+
+    except Exception as e:
+        mark_and_update(board, slot, "copy", "failed", f"exception: {e}")
+        return False
+
+# ---------------------------- FORMAT ----------------------------
+def _mountvol_offline(letter: str) -> None:
+    try:
+        subprocess.run(["cmd", "/c", f"mountvol {letter}: /p"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+def format_usb_drive_exfat_cmd_safe(port: str, board: str, slot: int, drive_letter: str, label: str = "MFLB1S1", timeout_sec: int = 300) -> bool:
+    if CANCEL_EVENT.is_set():
+        return False
+    dl = drive_letter.strip("\\/:").upper()
+    cmd = f"format {dl}: /FS:exFAT /V:{label} /Y /Q"
+    try:
+        subprocess.run(["cmd", "/c", cmd], capture_output=True, text=True, input="\n", timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        _format_recovery_no_retry(port, board, slot, dl)
+        return False
+    except Exception:
+        _format_recovery_no_retry(port, board, slot, dl)
+        return False
+
+    ok = False
+    for _ in range(24):
+        if CANCEL_EVENT.is_set():
+            break
+        fs = (get_fs_type_by_letter(dl) or "").lower()
+        if fs == "exfat":
+            ok = True
+            break
+        time.sleep(0.5)
+
+    if ok:
+        return True
+
+    _format_recovery_no_retry(port, board, slot, dl)
+    return False
+
+def _format_recovery_no_retry(port: str, board: str, slot: int, dl: str) -> None:
+    _mountvol_offline(dl)
+    try:
+        disconnect_mux(port, board)
+    except Exception:
+        pass
+
+# ---------------------------- LOCK ----------------------------
+BOOT_LOCK = threading.RLock()
+
+# ---------------------------- UF2 BOOT+UPLOAD ----------------------------
+def _boot_and_upload_uf2(port: str, slot: int, uf2_path: str, board_name: str, phase_key: str) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board_name, slot, phase_key, "failed", "cancelled")
+        return False
+    if is_board_dead(board_name) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board_name, slot, phase_key, "failed", "port/board dead")
+        return False
+    for _ in range(3):
+        if CANCEL_EVENT.is_set():
+            mark_and_update(board_name, slot, phase_key, "failed", "cancelled")
+            return False
+        if is_board_dead(board_name) or (_norm_port(port) in DEAD_PORTS):
+            mark_and_update(board_name, slot, phase_key, "failed", "port/board dead")
+            return False
+        resp = send_command(port, str(slot))
+        if resp is None:
+            mark_and_update(board_name, slot, phase_key, "failed", "serial open failed")
+            return False
+        time.sleep(2)
+        rp_drive = wait_for_new_drive(timeout=5, expect_bootloader=True)
+        if rp_drive:
+            try:
+                shutil.copy2(uf2_path, os.path.join(rp_drive, os.path.basename(uf2_path)))
+                time.sleep(5)
+                mark_and_update(board_name, slot, phase_key, "success", "")
+                return True
+            except Exception as e:
+                mark_and_update(board_name, slot, phase_key, "failed", f"UF2 upload failed: {e}")
+                return False
+    mark_and_update(board_name, slot, phase_key, "failed", "bootloader not detected")
+    return False
+
+# ---------------------------- PER-SLOT OPS ----------------------------
+def op_data_slot(board: str, port: str, expected_slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, expected_slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, expected_slot, "copy", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, expected_slot, "copy", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    expected_bidx = board_index(board)
+    with BOOT_LOCK:
+        ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
+        if not ok:
+            mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
+            return False
+
+        prefix = get_board_label_prefix(board)
+        expected_label = build_label(prefix, expected_bidx, expected_slot)
+        sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
+        if not sd_drive:
+            sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
+        if not sd_drive:
+            mark_and_update(board, expected_slot, "copy", "failed", "sd not detected")
+            return False
+
+        vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+        parsed = parse_compact_label(vol_label)
+
+        if vol_label:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+        else:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{expected_bidx}S{expected_slot}")
+
+        if parsed:
+            _, lbl_bidx, lbl_slot = parsed
+            t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+        else:
+            t_board = board; t_slot = expected_slot
+
+    okcopy = copy_sdcard_files(sd_drive, by_label_dir, t_board, t_slot)
+
+    if okcopy:
+        mark_and_update(board, expected_slot, "copy", "success",
+                        f"copied via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, expected_slot, "copy", "failed",
+                        f"copy failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    disconnect_mux(port, board)
+    return bool(okcopy)
+
+def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, expected_slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, expected_slot, "copy", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, expected_slot, "copy", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    expected_bidx = board_index(board)
+    with BOOT_LOCK:
+        ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
+        if not ok:
+            mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
+            return False
+
+        prefix = get_board_label_prefix(board)
+        expected_label = build_label(prefix, expected_bidx, expected_slot)
+        sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
+        if not sd_drive:
+            sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
+        if not sd_drive:
+            mark_and_update(board, expected_slot, "copy", "failed", "sd not detected")
+            return False
+
+        vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+        parsed = parse_compact_label(vol_label)
+
+        if vol_label:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+        else:
+            by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{expected_bidx}S{expected_slot}")
+
+        if parsed:
+            _, lbl_bidx, lbl_slot = parsed
+            t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+        else:
+            t_board = board; t_slot = expected_slot
+
+    oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
+
+    if oklog:
+        mark_and_update(board, expected_slot, "copy", "success",
+                        f"logged via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, expected_slot, "copy", "failed",
+                        f"log failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    disconnect_mux(port, board)
+    return bool(oklog)
+
+def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "copy", "failed", "port/board dead")
+        return False
+
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "copy", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
+    sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
+    if not sd_drive:
+        sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "copy", "failed", "sd not detected")
+        send_command(port, "9"); time.sleep(2.0)
+        return False
+
+    vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+    parsed = parse_compact_label(vol_label)
+
+    if vol_label:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+    else:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
+
+    if parsed:
+        _, lbl_bidx, lbl_slot = parsed
+        t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+    else:
+        t_board = board; t_slot = slot
+
+    okcopy = copy_sdcard_files(sd_drive, by_label_dir, t_board, t_slot)
+
+    if okcopy:
+        mark_and_update(board, slot, "copy", "success",
+                        f"copied via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, slot, "copy", "failed",
+                        f"copy failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    send_command(port, "9")
+    time.sleep(2.0)
+    return bool(okcopy)
+
+def op_data_log_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "copy", "failed", "port/board dead")
+        return False
+
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "copy", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
+    sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
+    if not sd_drive:
+        sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "copy", "failed", "sd not detected")
+        send_command(port, "9"); time.sleep(2.0)
+        return False
+
+    vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+    parsed = parse_compact_label(vol_label)
+
+    if vol_label:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+    else:
+        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
+
+    if parsed:
+        _, lbl_bidx, lbl_slot = parsed
+        t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+    else:
+        t_board = board; t_slot = slot
+
+    oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
+
+    if oklog:
+        mark_and_update(board, slot, "copy", "success",
+                        f"logged via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, slot, "copy", "failed",
+                        f"log failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    send_command(port, "9")
+    time.sleep(2.0)
+    return bool(oklog)
+
+def op_format_slot(board: str, port: str, slot: int, mode: str, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "format", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "format", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "format", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    bidx = board_index(board)
+    ok = _boot_and_upload_uf2(port, slot, DATA_FIRMWARE, board, "boot_data")
+    if not ok:
+        mark_and_update(board, slot, "format", "failed", "boot data uf2 failed")
+        disconnect_mux(port, board); return False
+
+    sd_drive = wait_for_new_drive(timeout=25, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "format", "failed", "sd not detected")
+        disconnect_mux(port, board); return False
+
+    current_label = (get_drive_label(sd_drive.strip("\\")) or "").strip()
+    vol_label = current_label if current_label else build_label(mode, bidx, slot)
+
+    ok_fmt = format_usb_drive_exfat_cmd_safe(
+        port=port, board=board, slot=slot, drive_letter=sd_drive.strip("\\"), label=vol_label
+    )
+    mark_and_update(board, slot, "format", "success" if ok_fmt else "failed", "" if ok_fmt else "format error")
+    if not ok_fmt:
+        disconnect_mux(port, board); return False
+
+    time.sleep(1.0)
+    if enforce_label(sd_drive.strip("\\"), vol_label):
+        mark_and_update(board, slot, "label_verify", "success", "")
+    else:
+        mark_and_update(board, slot, "label_verify", "failed", "label verify failed after format")
+
+    disconnect_mux(port, board)
+    return True
+
+def op_format_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "format", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "format", "failed", "port/board dead")
+        return False
+
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "format", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    expected_label = build_label(prefix, bidx, slot)
+    sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
+    if not sd_drive:
+        sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "format", "failed", "sd not detected")
+        send_command(port, "9"); time.sleep(2.0)
+        return False
+
+    current_label = (get_drive_label(sd_drive.strip("\\")) or "").strip()
+    vol_label = current_label if current_label else expected_label
+
+    ok_fmt = format_usb_drive_exfat_cmd_safe(
+        port=port, board=board, slot=slot, drive_letter=sd_drive.strip("\\"), label=vol_label
+    )
+    mark_and_update(board, slot, "format", "success" if ok_fmt else "failed", "" if ok_fmt else "format error")
+    if not ok_fmt:
+        send_command(port, "9"); time.sleep(2.0)
+        return False
+
+    time.sleep(3.0)
+    if enforce_label(sd_drive.strip("\\"), vol_label):
+        mark_and_update(board, slot, "label_verify", "success", "")
+    else:
+        mark_and_update(board, slot, "label_verify", "failed", "label verify failed after format")
+
+    send_command(port, "9")
+    time.sleep(2.0)
+    return True
+
+def op_label_pref_slot(board: str, port: str, slot: int) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "label", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "label", "failed", "port/board dead")
+        return False
+
+    # Snapshot removable drives before connecting this slot so we can
+    # detect the new SD drive even if it appears very quickly.
+    try:
+        before_devs = {p.device for p in _iter_removable_partitions()}
+    except Exception:
+        before_devs = set()
+    # Debug helper: only for LABEL_PREF
+    try:
+        log(f"[{board}:{slot}] LABEL_PREF old drives = {sorted(before_devs) if before_devs else 'NONE'}")
+    except Exception:
+        pass
+
+    # We are in SD-card management menu; connect this slot
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "label", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    target_label = build_label(prefix, bidx, slot)
+
+    initial_state = {d: "" for d in before_devs} if before_devs else None
+    sd_drive = wait_for_new_drive(
+        timeout=20,
+        expect_bootloader=False,
+        initial_state=initial_state,
+        debug_tag=f"LABEL_PREF {board}:{slot}",
+    )
+    if not sd_drive:
+        mark_and_update(board, slot, "label", "failed", "sd not detected")
+        try:
+            send_command(port, "9")
+            time.sleep(2.0)
+        except Exception:
+            pass
+        return False
+
+    ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
+    if ok_lbl:
+        mark_and_update(board, slot, "label", "success", "")
+    else:
+        mark_and_update(board, slot, "label", "failed", "label verify failed")
+
+    try:
+        send_command(port, "9")
+        time.sleep(2.0)
+    except Exception:
+        pass
+
+    return bool(ok_lbl)
+
+def op_mfl_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "mfl_upload", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "mfl_upload", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "mfl_upload", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    ok = _boot_and_upload_uf2(port, slot, MFL_FIRMWARE, board, "mfl_upload")
+    disconnect_mux(port, board)
+    return bool(ok)
+
+def op_cmfl_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "mfl_upload", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "mfl_upload", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "mfl_upload", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    ok = _boot_and_upload_uf2(port, slot, CMFL_FIRMWARE, board, "mfl_upload")
+    disconnect_mux(port, board)
+    return bool(ok)
+
+def op_egp_burn_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "mfl_upload", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "mfl_upload", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "mfl_upload", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    ok = _boot_and_upload_uf2(port, slot, EGP_FIRMWARE, board, "mfl_upload")
+    disconnect_mux(port, board)
+    return bool(ok)
+
+def op_sensor_check_mfl_cmfl_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_sensor_check(board, slot, "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_sensor_check(board, slot, "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "0") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.2)
+        if send_command(port, "1") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+
+    mark_sensor_check(board, slot, "running", "")
+    slot_cmd = sensor_slot_command(slot)
+    before_ports = current_serial_devices()
+    if send_command(port, slot_cmd) is None:
+        mark_sensor_check(board, slot, "failed", "serial open failed (slot connect)")
+        return False
+    time.sleep(SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS)
+
+    sensor_port = wait_for_new_serial_device(
+        before_ports,
+        timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+        exclude=sensor_check_excluded_ports(),
+    )
+    if not sensor_port:
+        log(f"[{board}:{slot}] No sensor COM after {SENSOR_CHECK_PORT_APPEAR_SECONDS:.0f}s; starting recovery burn.")
+        recovery_before_ports = current_serial_devices()
+        if not recover_sensor_slot_firmware(board, port, slot):
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after cmd {slot_cmd}; recovery burn failed")
+            return False
+        sensor_port = wait_for_new_serial_device(
+            recovery_before_ports,
+            timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+            exclude=sensor_check_excluded_ports(),
+        )
+        if not sensor_port:
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after recovery burn")
+            return False
+
+    log(f"[{board}:{slot}] Sent sensor slot command {slot_cmd}; COM port detected: {sensor_port}. Sampling TMAG values for {SENSOR_CHECK_SAMPLE_SECONDS:.0f}s.")
+    ok, detail, raw_lines = monitor_tmag_values(sensor_port, SENSOR_CHECK_SAMPLE_SECONDS)
+    bad = [name for name, rec in detail.items() if not rec.get("ok")]
+    if raw_lines:
+        log(f"[{board}:{slot}] Sensor sample preview: {' | '.join(raw_lines[:3])}")
+    if ok:
+        mark_sensor_check(board, slot, "success", "", detail)
+        log(f"[{board}:{slot}] SENSOR CHECK OK: TMAG0-TMAG7 values varied.")
+    else:
+        err = "constant/missing values: " + ", ".join(bad)
+        mark_sensor_check(board, slot, "failed", err, detail)
+        log(f"[{board}:{slot}] SENSOR CHECK FAILED: {err}")
+
+    return ok
+
+def op_sensor_check_egp_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_sensor_check(board, slot, "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_sensor_check(board, slot, "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "0") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.2)
+        if send_command(port, "1") is None:
+            mark_sensor_check(board, slot, "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+
+    mark_sensor_check(board, slot, "running", "")
+    slot_cmd = sensor_slot_command(slot)
+    before_ports = current_serial_devices()
+    if send_command(port, slot_cmd) is None:
+        mark_sensor_check(board, slot, "failed", "serial open failed (slot connect)")
+        return False
+    time.sleep(SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS)
+
+    sensor_port = wait_for_new_serial_device(
+        before_ports,
+        timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+        exclude=sensor_check_excluded_ports(),
+    )
+    if not sensor_port:
+        log(f"[{board}:{slot}] No EGP sensor COM after {SENSOR_CHECK_PORT_APPEAR_SECONDS:.0f}s; starting recovery burn.")
+        recovery_before_ports = current_serial_devices()
+        if not recover_sensor_slot_firmware(board, port, slot):
+            mark_sensor_check(board, slot, "failed", f"slot sensor COM not detected after cmd {slot_cmd}; recovery burn failed")
+            return False
+        sensor_port = wait_for_new_serial_device(
+            recovery_before_ports,
+            timeout_sec=SENSOR_CHECK_PORT_APPEAR_SECONDS,
+            exclude=sensor_check_excluded_ports(),
+        )
+        if not sensor_port:
+            mark_sensor_check(board, slot, "failed", "slot sensor COM not detected after recovery burn")
+            return False
+
+    log(f"[{board}:{slot}] Sent EGP sensor slot command {slot_cmd}; COM port detected: {sensor_port}. Sampling angle values for {SENSOR_CHECK_SAMPLE_SECONDS:.0f}s.")
+    ok, detail, raw_lines = monitor_tmag_angle_values(sensor_port, SENSOR_CHECK_SAMPLE_SECONDS)
+    bad = [name for name, rec in detail.items() if not rec.get("ok")]
+    if raw_lines:
+        log(f"[{board}:{slot}] EGP angle sample preview: {' | '.join(raw_lines[:3])}")
+    if ok:
+        mark_sensor_check(board, slot, "success", "", detail)
+        log(f"[{board}:{slot}] EGP SENSOR CHECK OK: discovered TMAG angle values varied.")
+    else:
+        err = "constant/missing angle values"
+        if bad:
+            err += ": " + ", ".join(bad)
+        mark_sensor_check(board, slot, "failed", err, detail)
+        log(f"[{board}:{slot}] EGP SENSOR CHECK FAILED: {err}")
+
+    return ok
+
+def op_label_slot_classic(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    # Original LABEL behavior: enter slot menu (1), boot DATA.uf2, and
+    # then label the SD card once it enumerates as a drive.
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "label", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "label", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, slot, "label", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    bidx = board_index(board)
+    with BOOT_LOCK:
+        if not _boot_and_upload_uf2(port, slot, DATA_FIRMWARE, board, "boot_data"):
+            mark_and_update(board, slot, "label", "failed", "boot data uf2 failed")
+            disconnect_mux(port, board); return False
+        sd_drive = wait_for_new_drive(timeout=40, expect_bootloader=False)
+        if not sd_drive:
+            mark_and_update(board, slot, "label", "failed", "sd not detected")
+            disconnect_mux(port, board); return False
+        prefix = get_board_label_prefix(board)
+        target_label = build_label(prefix, bidx, slot)
+    ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
+    if ok_lbl:
+        mark_and_update(board, slot, "label", "success", "")
+    else:
+        mark_and_update(board, slot, "label", "failed", "label verify failed")
+    disconnect_mux(port, board)
+    return bool(ok_lbl)
+
+def op_label_slot(board: str, port: str, slot: int, *, already_in_menu: bool = False) -> bool:
+    # LABEL now uses the SD-card menu (2 → slot) flow that was
+    # previously used only for LABEL_PREF.
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, slot, "label", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, slot, "label", "failed", "port/board dead")
+        return False
+
+    # We assume the board is already in the SD-card management menu.
+    if send_command(port, str(slot)) is None:
+        mark_and_update(board, slot, "label", "failed", "serial open failed (slot connect)")
+        return False
+
+    bidx = board_index(board)
+    prefix = get_board_label_prefix(board)
+    target_label = build_label(prefix, bidx, slot)
+
+    sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+    if not sd_drive:
+        mark_and_update(board, slot, "label", "failed", "sd not detected")
+        try:
+            send_command(port, "9")
+            time.sleep(2.0)
+        except Exception:
+            pass
+        return False
+
+    ok_lbl = enforce_label(sd_drive.strip("\\"), target_label)
+    if ok_lbl:
+        mark_and_update(board, slot, "label", "success", "")
+    else:
+        mark_and_update(board, slot, "label", "failed", "label verify failed")
+
+    try:
+        send_command(port, "9")
+        time.sleep(2.0)
+    except Exception:
+        pass
+
+    return bool(ok_lbl)
+
+def retry_single(board_name: str, slot: int, mode: str) -> bool:
+    if CANCEL_EVENT.is_set():
+        return False
+    if is_board_dead(board_name):
+        log(f"[{board_name}] Retry skipped: board marked dead.")
+        return False
+    port = get_port_for_board(board_name)
+    if not port or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board_name}] Retry skipped: port dead or not found.")
+        return False
+    try:
+        if mode == "DATA_PREF":
+            if not enter_pref_mode89_menu(port, board_name):
+                return False
+        elif mode == "MFL_PREF":
+            if not enter_pref_mode89_menu(port, board_name):
+                return False
+        elif mode == "LABEL_PREF":
+            send_command(port, "0")
+            time.sleep(0.05)
+            if not enter_sd_menu(port, board_name):
+                return False
+
+        if mode == "DATA":
+            return op_data_slot(board_name, port, slot)
+        if mode == "DATA_LOG":
+            return op_data_log_slot(board_name, port, slot)
+        if mode == "DATA_PREF":
+            return op_data_pref_slot(board_name, port, slot)
+        if mode == "DATA_LOG_PREF":
+            return op_data_log_pref_slot(board_name, port, slot)
+        if mode == "MFL":
+            return op_format_slot(board_name, port, slot, "MFL")
+        if mode == "MFL_PREF":
+            return op_format_pref_slot(board_name, port, slot)
+        if mode == "MFL_ALL_SLOTS":
+            return op_mfl_burn_slot(board_name, port, slot)
+        if mode == "CMFL_ALL_SLOTS":
+            return op_cmfl_burn_slot(board_name, port, slot)
+        if mode == "EGP_ALL_SLOTS":
+            return op_egp_burn_slot(board_name, port, slot)
+        if mode == "CHECK_SENSOR_MFL_CMFL":
+            return op_sensor_check_mfl_cmfl_slot(board_name, port, slot)
+        if mode == "CHECK_SENSOR_EGP":
+            return op_sensor_check_egp_slot(board_name, port, slot)
+        if mode == "AUTO_FORMAT_BURN":
+            ok_fmt = op_format_slot(board_name, port, slot, "MFL")
+            if not ok_fmt:
+                return False
+            return op_mfl_burn_slot(board_name, port, slot)
+        if mode == "AUTO_FORMAT_BURN_EGP":
+            ok_fmt = op_format_slot(board_name, port, slot, "MFL")
+            if not ok_fmt:
+                return False
+            return op_egp_burn_slot(board_name, port, slot)
+        if mode == "LABEL":
+            return op_label_slot_classic(board_name, port, slot)
+        if mode == "LABEL_PREF":
+            return op_label_slot(board_name, port, slot)
+        return False
+    finally:
+        try:
+            update_simple_log(BOARD_PORTS_CURRENT, MODE_CURRENT)
+        except Exception:
+            pass
+
+# ---------------------------- SELECTION ----------------------------
+def selected_slots_for(board: str, selection: Optional[Dict[str, Set[int]]]) -> List[int]:
+    lim = get_slot_limit(board)
+    if lim <= 0:
+        return []
+    excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+    if not selection:
+        return [s for s in range(1, lim + 1) if s not in excluded]
+    slots = [s for s in selection.get(board, set()) if 1 <= int(s) <= lim and int(s) not in excluded]
+    return sorted(int(s) for s in slots)
+
+# ---------------------------- FLOWS ----------------------------
+def _cancelled() -> bool:
+    return CANCEL_EVENT.is_set()
+
+def process_board_parallel(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_data_log(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_log_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_data_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if not enter_pref_mode89_menu(port, board):
+        log(f"[{board}] Could not enter preferred setup for mode 8; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_pref_slot(board, port, slot)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_data_log_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if not enter_sd_menu(port, board):
+        log(f"[{board}] Could not enter SD menu; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_data_log_pref_slot(board, port, slot)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_format(board: str, port: str, mode: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_format_slot(board, port, slot, mode, already_in_menu=True)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_format_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if not enter_pref_mode89_menu(port, board):
+        log(f"[{board}] Could not enter preferred setup for mode 9; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_format_pref_slot(board, port, slot)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_mfl_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_mfl_burn_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_cmfl_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_cmfl_burn_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_upload_code(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    btype = get_board_type(board).upper()
+    if btype == "EGP":
+        process_board_egp_all_slots(board, port, selection, stagger_seconds=0)
+    elif btype == "C-MFL":
+        process_board_cmfl_all_slots(board, port, selection, stagger_seconds=0)
+    else:
+        process_board_mfl_all_slots(board, port, selection, stagger_seconds=0)
+
+def process_board_egp_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_egp_burn_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.25)
+        finally:
+            pass
+
+def process_board_sensor_check_mfl_cmfl(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    btype = get_board_type(board).upper()
+    if btype == "EGP":
+        log(f"[{board}] Skipping EGP board in MFL/CMFL sensor check mode.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot management menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        op_sensor_check_mfl_cmfl_slot(board, port, slot, already_in_menu=True)
+        time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
+
+def process_board_sensor_check_egp(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if get_board_type(board).upper() != "EGP":
+        log(f"[{board}] Skipping non-EGP board in EGP sensor check mode.")
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot management menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        op_sensor_check_egp_slot(board, port, slot, already_in_menu=True)
+        time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
+
+def process_board_auto_format_and_burn(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping.")
+        return
+    process_board_format(board, port, mode="MFL", selection=selection)
+    if not _cancelled() and not is_board_dead(board) and (_norm_port(port) not in DEAD_PORTS):
+        process_board_mfl_all_slots(board, port, selection=selection, stagger_seconds=0)
+
+def process_board_auto_format_and_burn_egp(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping.")
+        return
+    process_board_format(board, port, mode="MFL", selection=selection)
+    if not _cancelled() and not is_board_dead(board) and (_norm_port(port) not in DEAD_PORTS):
+        process_board_egp_all_slots(board, port, selection=selection, stagger_seconds=0)
+
+def process_board_label_only(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping remaining slots.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_label_slot_classic(board, port, slot, already_in_menu=True)
+            time.sleep(0.2)
+        finally:
+            pass
+
+def process_board_label_preferred(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if not enter_sd_menu(port, board):
+        log(f"[{board}] Could not enter SD menu; skipping board.")
+        return
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            op_label_pref_slot(board, port, slot)
+            time.sleep(0.2)
+        finally:
+            pass
+
+# -------- NEW: DATA_PREF coordinator (sequential connect, parallel copy) --------
+def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selection: Optional[Dict[str, Set[int]]], kick_gap_sec: float = 2.0) -> None:
+    states: List[Dict[str, object]] = []
+    for board, port in selected_boards:
+        if _cancelled():
+            return
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping board.")
+            continue
+        if not enter_pref_mode89_menu(port, board):
+            log(f"[{board}] Could not enter preferred setup for mode 8; skipping board.")
+            continue
+        slots = selected_slots_for(board, selection)
+        states.append({
+            "board": board,
+            "port": port,
+            "pending": slots[:],
+            "current": None  # (future, slot)
+        })
+
+    if not states:
+        return
+
+    max_workers = min(8, max(1, len(states)))
+    last_kick = 0.0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        while True:
+            if _cancelled():
+                break
+            any_pending_or_running = any(s["pending"] or s["current"] for s in states)
+            if not any_pending_or_running:
+                break
+
+            now = time.time()
+            if now - last_kick >= kick_gap_sec:
+                started_any = False
+                for s in states:
+                    if s["current"] is not None:
+                        continue
+                    if not s["pending"]:
+                        continue
+                    board = s["board"]; port = s["port"]
+                    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+                        s["pending"].clear()
+                        continue
+
+                    slot = s["pending"].pop(0)
+                    if send_command(port, str(slot)) is None:
+                        mark_and_update(board, slot, "copy", "failed", "serial open failed (slot connect)")
+                        continue
+
+                    bidx = board_index(board)
+                    prefix = get_board_label_prefix(board)
+                    expected_label = build_label(prefix, bidx, slot)
+                    sd_drive = wait_for_drive_by_label([expected_label], timeout=15)
+                    if not sd_drive:
+                        sd_drive = wait_for_new_drive(timeout=20, expect_bootloader=False)
+                    if not sd_drive:
+                        mark_and_update(board, slot, "copy", "failed", "sd not detected")
+                        try:
+                            send_command(port, "9")
+                        except Exception:
+                            pass
+                        time.sleep(0.3)
+                        continue
+
+                    vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+                    parsed = parse_compact_label(vol_label)
+
+                    if vol_label:
+                        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
+                    else:
+                        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
+
+                    if parsed:
+                        _, lbl_bidx, lbl_slot = parsed
+                        t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+                    else:
+                        t_board = board; t_slot = slot
+
+                    fut = pool.submit(copy_sdcard_files, sd_drive, by_label_dir, t_board, t_slot)
+                    s["current"] = (fut, slot, board, port)
+                    last_kick = time.time()
+                    started_any = True
+                    break  # only one kickoff per gap
+
+                if not started_any:
+                    time.sleep(0.05)
+
+            # Harvest finished copies
+            for s in states:
+                cur = s["current"]
+                if not cur:
+                    continue
+                fut, slot, board, port = cur
+                if fut.done():
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        mark_and_update(board, slot, "copy", "failed", f"exception: {e}")
+                    try:
+                        send_command(port, "9")
+                    except Exception:
+                        pass
+                    time.sleep(0.4)
+                    s["current"] = None
+
+            time.sleep(0.05)
+
+# ---------------------------- SPECIAL MODES (ODO / INLB) ----------------------------
+def process_odo_extraction() -> None:
+    target = find_named_board("ODO")
+    if not target:
+        log("[ODO] Board named 'ODO' not found.")
+        return
+    board, port = target
+    ok = True
+    # Try to ensure we are at the main menu first, then enter ODO menu with 'm'.
+    # Extra delays added because this menu was flaky in earlier builds.
+    try:
+        send_command(port, "0")
+    except Exception:
+        pass
+    time.sleep(1.0)
+
+    resp_m = send_command(port, "m")
+    if resp_m is None:
+        ok = False
+    time.sleep(3.0)
+
+    if ok and send_command(port, "1") is None:
+        ok = False
+    time.sleep(2.0)
+    if ok and send_command(port, "2") is None:
+        ok = False
+    mark_and_update(board, 0, "special", "success" if ok else "failed", "" if ok else "serial failed")
+    log(f"[ODO] Extraction sequence {'OK' if ok else 'FAILED'} (2s gaps).")
+
+def process_inlb_extraction() -> None:
+    target = find_named_board("INLB")
+    if not target:
+        log("[INLB] Board named 'INLB' not found.")
+        return
+    board, port = target
+    ok = True
+    if send_command(port, "!") is None:
+        ok = False
+    time.sleep(2.0)
+    if ok and send_command(port, "1") is None:
+        ok = False
+    mark_and_update(board, 0, "special", "success" if ok else "failed", "" if ok else "serial failed")
+    log(f"[INLB] Extraction sequence {'OK' if ok else 'FAILED'} (2s gap).")
+
+def process_finish_odo() -> None:
+    target = find_named_board("ODO")
+    if not target:
+        log("[ODO] Board named 'ODO' not found.")
+        return
+    board, port = target
+    ok = True
+    if send_command(port, "1") is None:
+        ok = False
+    time.sleep(2.0)
+    if ok and send_command(port, "0") is None:
+        ok = False
+    time.sleep(2.0)
+    if ok and send_command(port, "0") is None:
+        ok = False
+    mark_and_update(board, 0, "special", "success" if ok else "failed", "" if ok else "serial failed")
+    log(f"[ODO] Finish sequence {'OK' if ok else 'FAILED'} (1→0→0 with 2s gaps).")
+
+def process_finish_inlb() -> None:
+    target = find_named_board("INLB")
+    if not target:
+        log("[INLB] Board named 'INLB' not found.")
+        return
+    board, port = target
+    ok = True
+    if send_command(port, "8") is None:
+        ok = False
+    time.sleep(3.0)
+    if ok and send_command(port, "9") is None:
+        ok = False
+    mark_and_update(board, 0, "special", "success" if ok else "failed", "" if ok else "serial failed")
+    log(f"[INLB] Finish sequence {'OK' if ok else 'FAILED'} (8→wait3s→9).")
+
+# ---------------------------- SUMMARY ----------------------------
+def write_summary(option_mode: str, board_ports: Dict[str, str]) -> None:
+    summary = TRACKER.summarize(option_mode)
+    json_path = os.path.join(LOG_DIR, f"summary_{RUN_TS}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "option": option_mode,
+            "started": RUN_START,
+            "finished": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "boards": list(board_ports.keys()),
+            "stats": summary,
+            "detail": TRACKER.snapshot()
+        }, f, indent=2)
+
+# ---------------------------- ENGINE ----------------------------
+def _send_zero_to_selected_boards(selected_boards: List[Tuple[str, str]]) -> None:
+    for b, p in selected_boards:
+        if CANCEL_EVENT.is_set():
+            return
+        if not p:
+            continue
+        if is_board_dead(b) or (_norm_port(p) in DEAD_PORTS):
+            continue
+        try:
+            send_command(p, "0")
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    global MODE_CURRENT, BOARD_PORTS_CURRENT, RUN_SELECTION, SENSOR_CHECK_SAFELOCK_PORTS
+    start_new_run_reset()
+    MODE_CURRENT = mode
+    RUN_SELECTION = selection or None
+
+    BOARD_PORTS_CURRENT = detect_boards()
+    board_ports = BOARD_PORTS_CURRENT
+    SENSOR_CHECK_SAFELOCK_PORTS = {_norm_port(p) for p in board_ports.values()}
+    update_simple_log(board_ports, MODE_CURRENT)
+
+    selected_boards = list(board_ports.items())
+    if RUN_SELECTION:
+        selected_boards = [(b, p) for b, p in selected_boards if selected_slots_for(b, RUN_SELECTION)]
+    if mode == "CHECK_SENSOR_MFL_CMFL":
+        selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() != "EGP"]
+    elif mode == "CHECK_SENSOR_EGP":
+        selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() == "EGP"]
+
+    set_progress_total_from_selected(selected_boards, RUN_SELECTION)
+
+    if not selected_boards and mode not in ("ODO", "INLB"):
+        write_summary(mode, board_ports)
+        return
+
+    _send_zero_to_selected_boards(selected_boards)
+
+    try:
+        if mode == "DATA":
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_boards)))) as executor:
+                futures = [executor.submit(process_board_parallel, b, p, RUN_SELECTION) for b, p in selected_boards]
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] Worker crashed: {e}")
+
+        elif mode == "DATA_LOG":
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_boards)))) as executor:
+                futures = [executor.submit(process_board_data_log, b, p, RUN_SELECTION) for b, p in selected_boards]
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] Worker crashed: {e}")
+
+        elif mode == "DATA_PREF":
+            process_data_pref_pipelined(selected_boards, RUN_SELECTION, kick_gap_sec=2.0)
+
+        elif mode == "DATA_LOG_PREF":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_data_log_preferred(board, port, RUN_SELECTION)
+                time.sleep(0.4)
+
+        elif mode == "MFL":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_format(board, port, mode, RUN_SELECTION)
+                time.sleep(0.25)
+
+        elif mode == "MFL_PREF":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_format_preferred(board, port, RUN_SELECTION)
+                time.sleep(0.25)
+
+        elif mode == "MFL_ALL_SLOTS":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_mfl_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
+                time.sleep(0.25)
+
+        elif mode == "CMFL_ALL_SLOTS":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_cmfl_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
+                time.sleep(0.25)
+
+        elif mode == "EGP_ALL_SLOTS":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_egp_all_slots(board, port, RUN_SELECTION, stagger_seconds=0)
+                time.sleep(0.25)
+
+        elif mode == "CHECK_SENSOR_MFL_CMFL":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_sensor_check_mfl_cmfl(board, port, RUN_SELECTION)
+                time.sleep(0.25)
+
+        elif mode == "CHECK_SENSOR_EGP":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_sensor_check_egp(board, port, RUN_SELECTION)
+                time.sleep(0.25)
+
+        elif mode == "AUTO_FORMAT_BURN":
+            items = selected_boards
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
+                futures = []
+                for idx, (board, port) in enumerate(items):
+                    futures.append(executor.submit(process_board_auto_format_and_burn, board, port, RUN_SELECTION, stagger_seconds=idx * 3))
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] AUTO worker crashed: {e}")
+
+        elif mode == "AUTO_FORMAT_BURN_EGP":
+            items = selected_boards
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
+                futures = []
+                for idx, (board, port) in enumerate(items):
+                    futures.append(executor.submit(process_board_auto_format_and_burn_egp, board, port, RUN_SELECTION, stagger_seconds=idx * 3))
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] AUTO_EGP worker crashed: {e}")
+
+        elif mode == "UPLOAD_CODE":
+            items = selected_boards
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
+                futures = []
+                for idx, (board, port) in enumerate(items):
+                    futures.append(executor.submit(process_board_upload_code, board, port, RUN_SELECTION, stagger_seconds=idx * 2))
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] UPLOAD_CODE worker crashed: {e}")
+
+        elif mode == "LABEL":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_label_only(board, port, RUN_SELECTION)
+                time.sleep(0.2)
+
+        elif mode == "LABEL_PREF":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_label_preferred(board, port, RUN_SELECTION)
+                time.sleep(0.2)
+
+        elif mode == "ODO":
+            process_odo_extraction()
+
+        elif mode == "INLB":
+            process_inlb_extraction()
+
+        else:
+            log(f"[ERROR] Unknown mode: {mode}")
+    finally:
+        try:
+            update_simple_log(board_ports, MODE_CURRENT)
+        except Exception:
+            pass
+        write_summary(mode, board_ports)
+
+# ---------------------------- GUI ----------------------------
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QEvent, QObject, QPropertyAnimation)
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTextEdit, QComboBox, QTableWidget, QTableWidgetItem,
+    QSplitter, QSizePolicy, QMessageBox, QGroupBox, QListWidget, QListWidgetItem,
+    QLineEdit, QRadioButton, QProgressBar, QAction, QMenuBar, QCheckBox,
+    QAbstractItemView, QScrollArea, QDialog, QDialogButtonBox, QFrame, QGridLayout, QSpinBox, QTabWidget, QHeaderView, QStackedLayout, QListView
+)
+
+class QtLogEvent(QEvent):
+    TYPE = QEvent.Type(QEvent.registerEventType())
+    def __init__(self, message: str):
+        super().__init__(QtLogEvent.TYPE)
+        self.message = message
+
+class QtLogBridge(QObject):
+    _instance = None
+    log_signal = pyqtSignal(str)
+    def customEvent(self, event):
+        if isinstance(event, QtLogEvent):
+            self.log_signal.emit(event.message)
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = QtLogBridge()
+        return cls._instance
+
+# Serial monitor threads/dialog (Advanced)
+class SerialReaderThread(QThread):
+    received = pyqtSignal(str)
+    error = pyqtSignal(str)
+    def __init__(self, port_name: str, baud: int = 115200, parent=None):
+        super().__init__(parent)
+        self.port_name = port_name
+        self.baud = baud
+        self._stop = threading.Event()
+        self._ser = None
+    def run(self):
+        try:
+            self._ser = serial.Serial(self.port_name, self.baud, timeout=0.2)
+        except Exception as e:
+            self.error.emit(f"Open failed: {e}")
+            return
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = self._ser.read(1024)
+                    if data:
+                        try:
+                            self.received.emit(data.decode(errors="replace"))
+                        except Exception:
+                            self.received.emit(repr(data))
+                except Exception as e:
+                    self.error.emit(f"Read error: {e}")
+                    break
+        finally:
+            try:
+                if self._ser:
+                    self._ser.close()
+            except Exception:
+                pass
+    def write_line(self, text: str):
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.write((text + "\r\n").encode())
+        except Exception as e:
+            self.error.emit(f"Write error: {e}")
+    def stop(self):
+        self._stop.set()
+
+class SerialMonitorWindow(QDialog):
+    def __init__(self, parent, port_name: str, title: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title or f"Serial Monitor - {port_name}")
+        self.resize(750, 500)  # resizable by default
+        self.reader: Optional[SerialReaderThread] = None
+        self.port_name = port_name
+
+        v = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel(f"Port: {port_name}"))
+        top.addStretch(1)
+        self.lbl_status = QLabel("Status: idle")
+        top.addWidget(self.lbl_status)
+        v.addLayout(top)
+
+        self.monitor = QTextEdit(); self.monitor.setReadOnly(True)
+        v.addWidget(self.monitor, 1)
+        send_row = QHBoxLayout()
+        self.send_line = QLineEdit(); self.send_line.setPlaceholderText("Enter command and press Send (CRLF)")
+        self.btn_send = QPushButton("Send")
+        send_row.addWidget(self.send_line, 1); send_row.addWidget(self.btn_send)
+        v.addLayout(send_row)
+
+        self.btn_send.clicked.connect(self.on_send)
+        self.send_line.returnPressed.connect(self.on_send)
+
+        self._start_reader()
+
+    def _start_reader(self):
+        try:
+            self.reader = SerialReaderThread(self.port_name, 115200)
+            self.reader.received.connect(self._append_text)
+            self.reader.error.connect(self._on_error)
+            self.reader.start()
+            self.lbl_status.setText(f"Status: connected to {self.port_name}")
+        except Exception as e:
+            self._append_text(f"[ERR] Failed to open {self.port_name}: {e}\n")
+            self.lbl_status.setText("Status: failed")
+
+    def _append_text(self, s: str):
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+        self.monitor.insertPlainText(s)
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+
+    def _on_error(self, msg: str):
+        self._append_text(f"[ERR] {msg}\n")
+        self.lbl_status.setText(f"Status: {msg}")
+
+    def on_send(self):
+        txt = self.send_line.text().strip()
+        if not txt:
+            return
+        if not self.reader or not self.reader.isRunning():
+            QMessageBox.information(self, "Send", "Not connected.")
+            return
+        try:
+            self.reader.write_line(txt)
+            self._append_text(f"> {txt}\n")
+            self.send_line.clear()
+        except Exception as e:
+            QMessageBox.warning(self, "Send", f"Failed: {e}")
+
+    def closeEvent(self, e):
+        try:
+            if self.reader:
+                self.reader.stop()
+                self.reader.wait(1500)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+class AdvancedDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Advanced Tools")
+        self.resize(900, 600)
+        self.reader: Optional[SerialReaderThread] = None
+        self.monitor_windows: List[SerialMonitorWindow] = []
+
+        v = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.board_combo = QComboBox()
+        self.custom_port = QLineEdit(); self.custom_port.setPlaceholderText("Manual COM port (e.g. COM7)")
+        self.btn_refresh_ports = QPushButton("Refresh Ports")
+        self.btn_connect = QPushButton("Connect")
+        self.btn_disconnect = QPushButton("Disconnect"); self.btn_disconnect.setEnabled(False)
+        self.btn_new_window = QPushButton("Open Monitor Window")
+        self.lbl_status = QLabel("Status: idle")
+        self._refresh_ports()
+        top.addWidget(QLabel("Port:")); top.addWidget(self.board_combo, 1)
+        top.addWidget(self.custom_port, 1)
+        top.addWidget(self.btn_refresh_ports)
+        top.addWidget(self.btn_connect); top.addWidget(self.btn_disconnect); top.addWidget(self.btn_new_window)
+        top.addStretch(1); top.addWidget(self.lbl_status)
+        v.addLayout(top)
+
+        self.monitor = QTextEdit(); self.monitor.setReadOnly(True)
+        v.addWidget(self.monitor, 1)
+        send_row = QHBoxLayout()
+        self.send_line = QLineEdit(); self.send_line.setPlaceholderText("Enter command and press Send (CRLF)")
+        self.btn_send = QPushButton("Send")
+        send_row.addWidget(self.send_line, 1); send_row.addWidget(self.btn_send)
+        v.addLayout(send_row)
+
+        uf_row = QHBoxLayout()
+        self.btn_up_data = QPushButton("Upload DATA.uf2 to RPI-RP2")
+        self.btn_up_mfl  = QPushButton("Upload MFL.uf2 to RPI-RP2")
+        self.btn_up_cmfl = QPushButton("Upload CMFL.uf2 to RPI-RP2")
+        self.btn_up_egp  = QPushButton("Upload EGP.uf2 to RPI-RP2")
+        uf_row.addWidget(self.btn_up_data); uf_row.addWidget(self.btn_up_mfl); uf_row.addWidget(self.btn_up_cmfl); uf_row.addWidget(self.btn_up_egp); uf_row.addStretch(1)
+        v.addLayout(uf_row)
+
+        self.send_line.returnPressed.connect(self.on_send)
+        self.btn_connect.clicked.connect(self.on_connect)
+        self.btn_disconnect.clicked.connect(self.on_disconnect)
+        self.btn_send.clicked.connect(self.on_send)
+        self.btn_up_data.clicked.connect(lambda: self.on_upload(DATA_FIRMWARE))
+        self.btn_up_mfl.clicked.connect(lambda: self.on_upload(MFL_FIRMWARE))
+        self.btn_up_cmfl.clicked.connect(lambda: self.on_upload(CMFL_FIRMWARE))
+        self.btn_up_egp.clicked.connect(lambda: self.on_upload(EGP_FIRMWARE))
+        self.btn_refresh_ports.clicked.connect(self._refresh_ports)
+        self.btn_new_window.clicked.connect(self.on_open_monitor_window)
+
+    def _selected_port(self) -> Optional[str]:
+        manual = self.custom_port.text().strip()
+        if manual:
+            return manual
+        data = self.board_combo.currentData()
+        return data if isinstance(data, str) else None
+
+    def _refresh_ports(self):
+        current = self.board_combo.currentData()
+        self.board_combo.clear()
+        for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+            port = BOARD_PORTS_CURRENT.get(b, "")
+            if port:
+                self.board_combo.addItem(f"{b} ({port})", port)
+        listed_ports = {self.board_combo.itemData(i) for i in range(self.board_combo.count())}
+        for p in serial.tools.list_ports.comports():
+            dev = p.device
+            if dev and dev not in listed_ports:
+                desc = p.description or ""
+                self.board_combo.addItem(f"{dev} (unregistered) {desc}", dev)
+        if current:
+            idx = next((i for i in range(self.board_combo.count()) if self.board_combo.itemData(i) == current), -1)
+            if idx >= 0:
+                self.board_combo.setCurrentIndex(idx)
+
+    def on_connect(self):
+        if self.reader and self.reader.isRunning():
+            return
+        port = self._selected_port()
+        if not port:
+            QMessageBox.warning(self, "Connect", "Select or enter a COM port.")
+            return
+        self.reader = SerialReaderThread(port, 115200)
+        self.reader.received.connect(self._append_text)
+        self.reader.error.connect(self._on_error)
+        self.reader.start()
+        self.btn_connect.setEnabled(False)
+        self.btn_disconnect.setEnabled(True)
+        self.lbl_status.setText(f"Status: connected to {port}")
+
+    def on_disconnect(self):
+        if self.reader:
+            self.reader.stop()
+            self.reader.wait(1500)
+            self.reader = None
+        self.btn_connect.setEnabled(True)
+        self.btn_disconnect.setEnabled(False)
+        self.lbl_status.setText("Status: disconnected")
+
+    def on_send(self):
+        txt = self.send_line.text().strip()
+        if not txt:
+            return
+        if not self.reader or not self.reader.isRunning():
+            QMessageBox.information(self, "Send", "Not connected.")
+            return
+        self.reader.write_line(txt)
+        self._append_text(f"> {txt}\n")
+        self.send_line.clear()
+
+    def on_upload(self, uf2_path: str):
+        ok, fail, msgs = upload_uf2_to_all_rp2(uf2_path)
+        for m in msgs:
+            self._append_text(m + "\n")
+        QMessageBox.information(self, "UF2 Upload", f"OK: {ok}  |  Failed: {fail}")
+
+    def on_open_monitor_window(self):
+        if len(self.monitor_windows) >= 3:
+            QMessageBox.information(self, "Monitor", "Maximum 3 monitor windows already open.")
+            return
+        port = self._selected_port()
+        if not port:
+            QMessageBox.warning(self, "Monitor", "Select or enter a COM port.")
+            return
+        dlg = SerialMonitorWindow(self, port, title=f"Serial Monitor - {port}")
+        dlg.finished.connect(lambda _: self._on_monitor_closed(dlg))
+        dlg.show()
+        self.monitor_windows.append(dlg)
+
+    def _on_monitor_closed(self, dlg: SerialMonitorWindow):
+        try:
+            self.monitor_windows.remove(dlg)
+        except ValueError:
+            pass
+
+    def _append_text(self, s: str):
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+        self.monitor.insertPlainText(s)
+        self.monitor.moveCursor(self.monitor.textCursor().End)
+
+    def _on_error(self, msg: str):
+        self._append_text(f"[ERR] {msg}\n")
+        self.lbl_status.setText(f"Status: {msg}")
+
+    def closeEvent(self, e):
+        try:
+            self.on_disconnect()
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+# Worker threads
+class EngineThread(QThread):
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+    def __init__(self, mode: str, selection: Optional[Dict[str, Set[int]]]):
+        super().__init__()
+        self.mode = mode
+        self.selection = selection
+        self._err: Optional[str] = None
+    def run(self):
+        try:
+            process_all_boards_with_selection(self.mode, self.selection)
+        except Exception as e:
+            self._err = str(e)
+        finally:
+            if self._err:
+                self.failed.emit(self._err)
+            else:
+                self.finished_ok.emit()
+
+class RetryThread(QThread):
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+    def __init__(self, tasks: List[Tuple[str, int]], mode: str):
+        super().__init__()
+        self.tasks = tasks
+        self.mode = mode
+        self._err: Optional[str] = None
+    def run(self):
+        try:
+            boards = sorted({b for b, _ in self.tasks}, key=lambda n: (board_index(n), n))
+            for b in boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                p = get_port_for_board(b)
+                if p and (_norm_port(p) not in DEAD_PORTS) and not is_board_dead(b):
+                    try:
+                        send_command(p, "0")
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+
+            if self.mode in ("DATA_PREF", "MFL_PREF"):
+                for b in boards:
+                    if CANCEL_EVENT.is_set():
+                        break
+                    p = get_port_for_board(b)
+                    if p and (_norm_port(p) not in DEAD_PORTS) and not is_board_dead(b):
+                        if self.mode in ("DATA_PREF", "MFL_PREF"):
+                            enter_pref_mode89_menu(p, b)
+                        else:
+                            enter_sd_menu(p, b)
+                        time.sleep(0.05)
+
+            for (board, slot) in self.tasks:
+                if CANCEL_EVENT.is_set():
+                    break
+                retry_single(board, slot, self.mode)
+        except Exception as e:
+            self._err = str(e)
+        finally:
+            if self._err:
+                self.failed.emit(self._err)
+            else:
+                self.finished_ok.emit()
+
+# ---------------------------- THEME/QSS ----------------------------
+LIGHT_QSS = """
+* { font-family: 'Segoe UI', 'Roboto', Arial; font-size: 11pt; color: #0f172a; }
+QMainWindow { background-color: #f7f7fb; }
+QTabWidget::pane { border: 0; }
+QGroupBox {
+  border: 1px solid #d6e4ff;
+  border-radius: 12px;
+  margin-top: 20px;
+  background-color: #ffffff;
+  padding-top: 6px;
+}
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 12px;
+  padding: 6px 12px;
+  color: #2f5fa7;
+  background-color: #edf2ff;
+  border-radius: 10px;
+  font-weight: 800;
+  font-size: 12pt;
+  text-transform: uppercase;
+}
+QTabBar::tab {
+  background: #edf2ff;
+  color: #1f2937;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  padding: 10px 16px;
+  min-width: 150px;
+  margin: 0 6px 6px 0;
+  font-weight: 700;
+}
+QTabBar::tab:selected {
+  background: #3b6fd8;
+  color: white;
+}
+QTabBar::tab:hover {
+  background: #dbeafe;
+}
+QLabel { color: #0f172a; }
+QTextEdit, QListWidget {
+  background: #ffffff;
+  color: #111827;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 6px;
+}
+QTableWidget {
+  background: #ffffff;
+  color: #0f172a;
+  gridline-color: #e5e7eb;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+QHeaderView::section {
+  background: #eef2ff;
+  color: #1f2937;
+  border: 0px;
+  padding: 8px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+QLineEdit, QComboBox {
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #d9e1ec;
+  border-radius: 10px;
+  padding: 8px;
+}
+QComboBox QAbstractItemView {
+  background: #ffffff;
+  selection-background-color: #dbeafe;
+  color: #0f172a;
+  border: 1px solid #e5e7eb;
+}
+QPushButton {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2563eb, stop:1 #22c55e);
+  color: white;
+  border: 0px;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-weight: 600;
+}
+QPushButton:hover {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1d4ed8, stop:1 #16a34a);
+}
+QPushButton:disabled { background: #e5e7eb; color: #94a3b8; }
+QProgressBar {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  text-align: center;
+  color: #0f172a;
+  padding: 2px;
+}
+QProgressBar::chunk {
+  border-radius: 10px;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #22c55e, stop:1 #3b82f6);
+}
+QMenuBar { background: #ffffff; color: #2f5fa7; border-bottom: 1px solid #d6e4ff; }
+QMenuBar::item { background: transparent; padding: 6px 12px; }
+QMenuBar::item:selected { background: #dbeafe; border-radius: 8px; }
+QMenu {
+  background: #ffffff; color: #0f172a; border: 1px solid #e5e7eb; border-radius: 10px;
+}
+QMenu::item:selected { background: #eef2ff; border-radius: 6px; }
+QDialog {
+  background: #f5f8ff;
+}
+QDialog QLabel, QDialog QGroupBox::title, QDialog QHeaderView::section {
+  color: #0b3aa3;
+}
+QDialog QTextEdit, QDialog QListWidget, QDialog QTableWidget {
+  border: 1px solid #d7defa;
+}
+"""
+
+# ---------------------------- PICO & TEENSY SCANNERS ----------------------------
+def list_pico_text() -> str:
+    lines = ["=== Connected Raspberry Pi Pico Boards ===", ""]
+    found = False
+    for port in serial.tools.list_ports.comports():
+        try:
+            if port.vid == 0x2E8A:  # Raspberry Pi Foundation
+                found = True
+                lines.append(f"Port:         {port.device}")
+                lines.append(f"VID:PID:      {hex(port.vid)}:{hex(port.pid)}")
+                lines.append(f"Serial Number:{getattr(port,'serial_number', '')}")
+                lines.append(f"Description:  {port.description}")
+                lines.append("-" * 50)
+        except Exception:
+            continue
+    if not found:
+        lines.append("No Raspberry Pi Pico boards detected.")
+    return "\n".join(lines)
+
+# Teensy 4.0/4.1 are PJRC VID 0x16C0. Common Serial PIDs include 0x0483, 0x0489, 0x04D9, 0x04DD.
+TEENSY_VID = 0x16C0
+TEENSY_SERIAL_PIDS = {0x0483, 0x0489, 0x04D9, 0x04DD}
+
+def list_teensy_text() -> str:
+    lines = ["=== Connected Teensy Boards (PJRC) ===", ""]
+    found = False
+    for port in serial.tools.list_ports.comports():
+        try:
+            vid = getattr(port, "vid", None)
+            pid = getattr(port, "pid", None)
+            if vid == TEENSY_VID and (pid in TEENSY_SERIAL_PIDS or pid is None):
+                found = True
+                lines.append(f"Port:         {port.device}")
+                vp = f"{hex(vid) if vid is not None else 'N/A'}:{hex(pid) if pid is not None else 'N/A'}"
+                lines.append(f"VID:PID:      {vp}")
+                lines.append(f"Serial Number:{getattr(port,'serial_number', '')}")
+                lines.append(f"Description:  {port.description}")
+                lines.append("-" * 50)
+        except Exception:
+            continue
+    if not found:
+        lines.append("No Teensy boards detected.")
+    return "\n".join(lines)
+
+class PicoListDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connected Pico Serials")
+        self.resize(800, 500)
+        v = QVBoxLayout(self)
+        self.text = QTextEdit(self); self.text.setReadOnly(True)
+        self.text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        v.addWidget(self.text)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject); bb.accepted.connect(self.accept)
+        v.addWidget(bb)
+        self.refresh()
+    def refresh(self):
+        self.text.setPlainText(list_pico_text())
+
+class TeensyListDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connected Teensy Serials")
+        self.resize(800, 500)
+        v = QVBoxLayout(self)
+        self.text = QTextEdit(self); self.text.setReadOnly(True)
+        self.text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        v.addWidget(self.text)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject); bb.accepted.connect(self.accept)
+        v.addWidget(bb)
+        self.refresh()
+    def refresh(self):
+        self.text.setPlainText(list_teensy_text())
+
+# ---------------------------- ABOUT DIALOG ----------------------------
+class ScrollableAbout(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About - PIG DATA EXTRACTION UTILITY")
+        self.resize(900, 650)
+        layout = QVBoxLayout(self)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        content = QTextEdit(); content.setReadOnly(True)
+        content.setHtml(self.html_text())
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+    def html_text(self):
+     return """
+    <h2><b>PIG DATA EXTRACTION UTILITY</b></h2>
+    <p>
+    This tool automates SD formatting, firmware burning, data extraction, and 
+    slot-wise operations across many Pico-based boards in parallel.
+    It ensures reliable flashing, labeling, and log handling with full progress tracking.
+    </p>
+    <hr>
+    <h3>📌 <b>HOW TO USE THE UTILITY</b></h3>
+    <h4><b>1. Connect all boards</b></h4>
+    Plug all HUB boards (via USB-C hub or directly) to the PC before starting.
+    <h4><b>2. Scan Connected Picos</h4>
+    Use: <b>Tools → List Pico Serials</b> or <b>Scan Picos</b><br>
+    <h4><b>3. Scan Connected Teensy</b></h4>
+    Use: <b>Tools → List Teensy Serials</b> or <b>Scan TP</b><br>
+    <h4><b>4. Add Boards to Registry</b></h4>
+    In the <b>Board Registry</b> panel:
+    <ul>
+      <li>Click <b>Scan Picos</b> / <b>Scan TP</b> to view connected devices.</li>
+      <li>Click <b>Add From Detected</b> to import them.</li>
+      <li>Assign each entry a <b>Board Name</b> and <b>Type</b> (A-MFL / C-MFL / EGP).</li>
+      <li>Optionally set <b>Exclude Slots</b>.</li>
+      <li>Click <b>Save Registry</b>.</li>
+    </ul>
+    The registry is saved to <code>boards_config.json</code> (stored beside the EXE).
+    <hr>
+    """
+
+# ---------------------------- SCOPE DIALOG ----------------------------
+class ScopeDialog(QDialog):
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.setWindowTitle("Scope Selection & Progress")
+        self.resize(980, 760)
+        layout = QVBoxLayout(self)
+
+        # Scope controls
+        self.scope_all = QRadioButton("All boards & slots")
+        self.scope_custom = QRadioButton("Custom selection")
+        self.scope_all.setChecked(True)
+        self.scope_all.setStyleSheet("font-weight: 700;")
+        self.scope_custom.setStyleSheet("font-weight: 700;")
+        layout.addWidget(self.scope_all)
+        layout.addWidget(self.scope_custom)
+
+        layout.addWidget(QLabel("Select boards/slots (– = n/a, × = excluded):"))
+        self.sel_table = QTableWidget(0, 8)
+        self.sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.sel_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.sel_table.setMinimumHeight(300)
+        try:
+            self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+        layout.addWidget(self.sel_table, 3)
+
+        sel_btns = QHBoxLayout()
+        self.btn_scope_all = QPushButton("ALL")
+        self.btn_scope_none = QPushButton("NONE")
+        self.btn_scope_inv = QPushButton("INVERT")
+        sel_btns.addWidget(self.btn_scope_all)
+        sel_btns.addWidget(self.btn_scope_none)
+        sel_btns.addWidget(self.btn_scope_inv)
+        sel_btns.addStretch(1)
+        layout.addLayout(sel_btns)
+
+        # Progress snapshot
+        layout.addWidget(QLabel("Progress snapshot:"))
+        self.progress_table = QTableWidget(0, 8)
+        self.progress_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.progress_table.setMinimumHeight(300)
+        layout.addWidget(self.progress_table, 3)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close | QDialogButtonBox.Ok)
+        layout.addWidget(bb)
+
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self.scope_custom.toggled.connect(self._toggle_custom)
+        self.sel_table.verticalHeader().sectionDoubleClicked.connect(self._on_row_header_double_clicked)
+        self.btn_scope_all.clicked.connect(lambda: self._set_all_selection(True))
+        self.btn_scope_none.clicked.connect(lambda: self._set_all_selection(False))
+        self.btn_scope_inv.clicked.connect(self._invert_selection)
+
+        self._parent = parent
+        self.refresh_from_parent()
+
+    def _toggle_custom(self):
+        custom = self.scope_custom.isChecked()
+        self.sel_table.setEnabled(custom)
+        self.btn_scope_all.setEnabled(custom)
+        self.btn_scope_none.setEnabled(custom)
+        self.btn_scope_inv.setEnabled(custom)
+
+    def refresh_from_parent(self):
+        self.sel_table.setRowCount(len(self._parent._board_order))
+        try:
+            sel = self._parent._selection_from_ez_ui()
+        except Exception:
+            sel = None
+        default_checked = sel is None
+        for r, b in enumerate(self._parent._board_order):
+            self.sel_table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                item = QTableWidgetItem()
+                if c < lim:
+                    if (c+1) in excl:
+                        item.setFlags(Qt.ItemIsEnabled)
+                        item.setText("×")
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        checked = default_checked or (sel and b in sel and (c+1) in sel[b])
+                        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsEnabled)
+                    item.setText("–")
+                self.sel_table.setItem(r, c, item)
+        if sel:
+            self.scope_custom.setChecked(True)
+        else:
+            self.scope_all.setChecked(True)
+        self._toggle_custom()
+        # Progress snapshot
+        try:
+            self._parent._setup_progress_table(self.progress_table)
+            self._parent._refresh_progress_table(self.progress_table, TRACKER.snapshot(), MODE_CURRENT or self._parent.mode_combo.currentData())
+        except Exception:
+            pass
+
+    def selected_scope(self) -> Optional[Dict[str, Set[int]]]:
+        if self.scope_all.isChecked():
+            return None
+        selection: Dict[str, Set[int]] = {}
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            slots: Set[int] = set()
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl and it.checkState() == Qt.Checked:
+                    slots.add(c+1)
+            if slots:
+                selection[b] = slots
+        return selection or None
+
+    def _on_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._parent._board_order):
+            return
+        board = self._parent._board_order[row]
+        lim = get_slot_limit(board)
+        excl = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excl:
+                continue
+            it = self.sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
+    def _set_all_selection(self, checked: bool) -> None:
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl:
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def _invert_selection(self) -> None:
+        for r, b in enumerate(self._parent._board_order):
+            lim = get_slot_limit(b)
+            excl = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excl:
+                    it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+
+# ---------------------------- REGISTRY DIALOG ----------------------------
+class RegistryDialog(QDialog):
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Board Registry - Full View")
+        self.resize(1100, 700)
+
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)", "Total Slots"])
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_scan = QPushButton("Scan Picos")
+        self.btn_scan_teensy = QPushButton("Scan TP")
+        self.btn_add_detected = QPushButton("Add From Detected")
+        self.btn_add = QPushButton("Add Row")
+        self.btn_del = QPushButton("Delete Row")
+        self.btn_save = QPushButton("Save Registry")
+        for b in (self.btn_scan, self.btn_scan_teensy, self.btn_add_detected, self.btn_add, self.btn_del, self.btn_save):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.parent._populate_registry_table(self.table)
+        self.parent._highlight_registry_matches(self.table, DETECTED_SERIALS_CURRENT)
+
+        self.btn_add.clicked.connect(lambda: self.parent._reg_add_row(self.table))
+        self.btn_del.clicked.connect(lambda: self.parent._reg_delete_row(self.table))
+        self.btn_add_detected.clicked.connect(lambda: self.parent._reg_add_from_detected(self.table))
+        self.btn_scan.clicked.connect(self.parent.on_scan_picos)
+        self.btn_scan_teensy.clicked.connect(self.parent.on_scan_teensy)
+        self.btn_save.clicked.connect(self._on_save)
+
+    def _on_save(self):
+        if self.parent._reg_save_table(self.table):
+            QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
+            self.parent.on_detect()
+            self.parent._populate_registry_table(self.table)
+            self.parent._populate_registry_table(self.parent.reg_table)
+            self.parent._highlight_registry_matches(self.table, DETECTED_SERIALS_CURRENT)
+            self.parent._highlight_registry_matches(self.parent.reg_table, DETECTED_SERIALS_CURRENT)
+
+# ---------------------------- MAIN WINDOW ----------------------------
+class MainWindow(QMainWindow):
+    MODES = [
+        ("DATA", "1. DATA EXTRACTION FALLBACK"),
+        ("MFL", "2. FORMAT ALL SLOTS FALLBACK"),
+        ("MFL_ALL_SLOTS", "3. BURN MFL.uf2"),
+        ("CMFL_ALL_SLOTS", "4. BURN CMFL.uf2"),
+        ("LABEL", "5. LABEL ALL SLOTS"),
+        ("EGP_ALL_SLOTS", "6. BURN EGP.uf2 (all slots)"),
+        ("AUTO_FORMAT_BURN_EGP", "7. AUTO: Format → Burn EGP"),
+        ("DATA_PREF", "8. DATA EXTRACTION PREFERRED"),
+        ("MFL_PREF", "9. FORMAT ALL SLOTS PREFERRED"),
+        ("ODO", "10. ODO EXTRACTION"),
+        ("INLB", "11. INLB EXTRACTION"),
+        ("DATA_LOG", "12. DATA EXTRACTION LOG"),
+        ("DATA_LOG_PREF", "13. DATA EXTRACTION LOG PREFERRED"),
+        ("LABEL_PREF", "14. LABEL SLOTS PREFFERED"),
+        ("CHECK_SENSOR_MFL_CMFL", "15. CHECK SENSOR VALUES MFL/CMFL"),
+        ("CHECK_SENSOR_EGP", "16. CHECK SENSOR VALUES EGP"),
+    ]
+    BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PIG DATA EXTRACTION UTILITY")
+        self.resize(1600, 950)
+        self.setStyleSheet(LIGHT_QSS)
+
+        self.engine_thread: Optional[EngineThread] = None
+        self.retry_thread: Optional[RetryThread] = None
+        self._board_order: List[str] = []
+        self._timer = QTimer(self); self._timer.setInterval(500); self._timer.timeout.connect(self.refresh_views)
+        self._prog_timer = QTimer(self); self._prog_timer.setInterval(400); self._prog_timer.timeout.connect(self.refresh_progress)
+
+        self._build_menubar()
+
+        # Top controls
+        top_row = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        for key, label in self.MODES:
+            self.mode_combo.addItem(label, key)
+        self.detect_btn = QPushButton("Detect Boards")
+        self.start_btn = QPushButton("Start")
+        self.cancel_btn = QPushButton("Cancel")
+        self.finish_odo_btn = QPushButton("Finish ODO")
+        self.finish_inlb_btn = QPushButton("Finish INLB")
+        self.open_folder_btn = QPushButton("Open Logs Folder")
+        top_row.addWidget(QLabel("Mode:"))
+        top_row.addWidget(self.mode_combo)
+        top_row.addWidget(self.detect_btn)
+        top_row.addWidget(self.start_btn)
+        top_row.addWidget(self.cancel_btn)
+        top_row.addWidget(self.finish_odo_btn)
+        top_row.addWidget(self.finish_inlb_btn)
+        top_row.addStretch(1)
+        top_row.addWidget(self.open_folder_btn)
+
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.setMinimum(0); self.progress.setMaximum(100); self.progress.setValue(0)
+        self.progress_anim = QPropertyAnimation(self.progress, b"value")
+        self.progress_anim.setDuration(300)
+
+        # Data extraction options
+        self.data_opts_group = QGroupBox("Data Extraction Options")
+        data_layout = QVBoxLayout()
+        data_layout.setContentsMargins(10, 8, 10, 8)
+        data_layout.setSpacing(8)
+        self.cb_custom_files = QCheckBox("Enable custom file selection (Data/Data Pref)")
+        self.cb_custom_files.setToolTip("Copy only a slice of files when extracting data.")
+        self.sb_skip = QSpinBox(); self.sb_skip.setRange(0, 100000); self.sb_skip.setValue(0)
+        self.sb_take = QSpinBox(); self.sb_take.setRange(0, 100000); self.sb_take.setValue(0)
+        self.sb_tail = QSpinBox(); self.sb_tail.setRange(0, 100000); self.sb_tail.setValue(0)
+        for sb in (self.sb_skip, self.sb_take, self.sb_tail):
+            sb.setEnabled(False)
+        for sb in (self.sb_skip, self.sb_take, self.sb_tail):
+            sb.setMinimumWidth(90)
+        data_layout.addWidget(self.cb_custom_files)
+        slice_row = QHBoxLayout()
+        slice_row.setSpacing(14)
+        slice_row.addWidget(QLabel("Skip first"))
+        slice_row.addWidget(self.sb_skip)
+        slice_row.addWidget(QLabel("Copy after skip"))
+        slice_row.addWidget(self.sb_take)
+        slice_row.addWidget(QLabel("Copy from end"))
+        slice_row.addWidget(self.sb_tail)
+        slice_row.addStretch(1)
+        data_layout.addLayout(slice_row)
+        self.data_opts_group.setLayout(data_layout)
+        self.data_opts_group.setMaximumHeight(96)
+
+        # Boards list
+        boards_group = QGroupBox("Detected Boards")
+        boards_layout = QVBoxLayout()
+        boards_layout.setContentsMargins(10, 8, 10, 8)
+        self.boards_list = QListWidget()
+        self.boards_list.setFlow(QListView.LeftToRight)
+        self.boards_list.setWrapping(True)
+        self.boards_list.setResizeMode(QListView.Adjust)
+        self.boards_list.setViewMode(QListView.ListMode)
+        self.boards_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.boards_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.boards_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.boards_list.setUniformItemSizes(True)
+        self.boards_list.setMinimumHeight(90)
+        self.boards_list.setMaximumHeight(130)
+        boards_layout.addWidget(self.boards_list)
+        boards_group.setLayout(boards_layout)
+        boards_group.setMaximumHeight(160)
+
+        # Progress table
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.table.verticalHeader().setVisible(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setMinimumHeight(320)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+
+        # Selection scope
+        sel_group = QGroupBox("Scope")
+        sg = QVBoxLayout()
+        rb_row = QHBoxLayout()
+        self.rb_all = QRadioButton("All detected boards")
+        self.rb_custom = QRadioButton("Custom selection")
+        self.rb_all.setChecked(True)
+        rb_row.addWidget(self.rb_all); rb_row.addWidget(self.rb_custom); rb_row.addStretch(1)
+        sg.addLayout(rb_row)
+
+        # Quick selection
+        quick_row = QHBoxLayout()
+        self.quick_board = QComboBox()
+        self.quick_slot = QComboBox()
+        for i in range(1, 9):
+            self.quick_slot.addItem(f"S{i}", i)
+        self.btn_quick_add = QPushButton("Add")
+        quick_row.addWidget(QLabel("Quick pick:"))
+        self.quick_board.setMinimumWidth(200)
+        quick_row.addWidget(self.quick_board)
+        quick_row.addWidget(self.quick_slot)
+        quick_row.addWidget(self.btn_quick_add)
+        quick_row.addStretch(1)
+        sg.addLayout(quick_row)
+
+        # Selection matrix
+        self.sel_table = QTableWidget(0, 8)
+        self.sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.sel_table.verticalHeader().setVisible(True)
+        self.sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.sel_table.setMinimumHeight(260)
+        self.sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+
+        sel_btns = QHBoxLayout()
+        self.btn_sel_all = QPushButton("All")
+        self.btn_sel_none = QPushButton("None")
+        self.btn_sel_inv = QPushButton("Invert")
+        sel_btns.addWidget(self.btn_sel_all); sel_btns.addWidget(self.btn_sel_none); sel_btns.addWidget(self.btn_sel_inv); sel_btns.addStretch(1)
+
+        sg.addWidget(QLabel("Custom: select boards × slots (grey cells = not available; × = excluded by registry)"))
+        sg.addWidget(self.sel_table)
+        sg.addLayout(sel_btns)
+        sel_group.setLayout(sg)
+        sel_group.setMinimumHeight(380)
+
+        # Registry
+        reg_group = QGroupBox("Board Registry (Serial → Name → Type → Exclude Slots)")
+        reg_layout = QVBoxLayout()
+        self.reg_table = QTableWidget(0, 6)
+        self.reg_table.setHorizontalHeaderLabels(["Serial", "Board Name", "Type (A-MFL/C-MFL/EGP)", "Pipe size (inches)", "Exclude Slots (e.g. 2,5)", "Total Slots"])
+        self.reg_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.reg_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        reg_btn_row = QHBoxLayout()
+        self.btn_reg_scan = QPushButton("Scan Picos")
+        self.btn_reg_scan_teensy = QPushButton("Scan TP")
+        self.btn_reg_add = QPushButton("Add Row")
+        self.btn_reg_add_detected = QPushButton("Add From Detected")
+        self.btn_reg_del = QPushButton("Delete Row")
+        self.btn_reg_save = QPushButton("Save Registry")
+        self.btn_reg_popup = QPushButton("Open Full Window")
+        reg_btn_row.addWidget(self.btn_reg_scan)
+        reg_btn_row.addWidget(self.btn_reg_scan_teensy)
+        reg_btn_row.addStretch(1)
+        reg_btn_row.addWidget(self.btn_reg_add_detected)
+        reg_btn_row.addWidget(self.btn_reg_add)
+        reg_btn_row.addWidget(self.btn_reg_del)
+        reg_btn_row.addWidget(self.btn_reg_save)
+        reg_btn_row.addWidget(self.btn_reg_popup)
+        reg_layout.addWidget(self.reg_table)
+        reg_layout.addLayout(reg_btn_row)
+        reg_group.setLayout(reg_layout)
+
+        # Left column (scrollable)
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addLayout(top_row)
+        left.addWidget(self.progress)
+        left.addWidget(self.data_opts_group)
+        left.addWidget(boards_group)
+        left.addWidget(QLabel("Progress (✅ ok | ❌ fail | ⏳ pending/running | – n/a | × excluded)"))
+        left.addWidget(self.table, 2)
+        left.addWidget(sel_group, 2)
+        left.addWidget(reg_group)
+        left_container = QWidget(); left_container.setLayout(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_container)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # Right column logs + retry
+        self.log_text = QTextEdit(); self.log_text.setReadOnly(True)
+        self.log_text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.simple_text = QTextEdit(); self.simple_text.setReadOnly(True)
+        self.simple_text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.simple_text.setMaximumHeight(160)
+        self.simple_text.setMinimumHeight(80)
+
+        right = QVBoxLayout()
+        lbl_live = QLabel("Live Log")
+        lbl_simple = QLabel("Simple Log (auto)")
+        right.addWidget(lbl_live)
+        right.addWidget(self.log_text)
+        right.addWidget(lbl_simple)
+        right.addWidget(self.simple_text)
+
+        # Retry panel
+        retry_group = QGroupBox("Retry")
+        retry_v = QVBoxLayout()
+
+        row1 = QGridLayout()
+        self.board_no_in = QLineEdit(); self.board_no_in.setPlaceholderText("Board No (e.g. 3)")
+        self.slot_no_in = QLineEdit(); self.slot_no_in.setPlaceholderText("Slot No (1-8)")
+        self.retry_one_btn = QPushButton("Retry Selected")
+        self.retry_one_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        row1.addWidget(QLabel("Board No:"), 0, 0)
+        row1.addWidget(self.board_no_in, 0, 1)
+        row1.addWidget(QLabel("Slot No:"), 0, 2)
+        row1.addWidget(self.slot_no_in, 0, 3)
+        row1.addWidget(self.retry_one_btn, 0, 4)
+        row1.setColumnStretch(1, 1)
+        row1.setColumnStretch(3, 1)
+        retry_v.addLayout(row1)
+
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)
+        retry_v.addWidget(line)
+
+        self.retry_extract_btn = QPushButton("Retry Extraction (failed in 8 → run 1, parallel)")
+        self.retry_format_btn  = QPushButton("Retry Formatting (failed in 9 → run 2)")
+        for b in (self.retry_extract_btn, self.retry_format_btn):
+            b.setMinimumHeight(36)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            b.setToolTip(b.text())
+        retry_v.addWidget(self.retry_extract_btn)
+        retry_v.addWidget(self.retry_format_btn)
+
+        retry_group.setLayout(retry_v)
+        right.addWidget(retry_group)
+
+        # Stretch priorities
+        right.setStretch(1, 5)
+        right.setStretch(3, 1)
+        right.setStretch(4, 3)
+
+        rightw = QWidget(); rightw.setLayout(right)
+        rightw.setMinimumWidth(380)
+        rightw.setMaximumWidth(540)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(rightw)
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1250, 350])
+
+        # Bottom stats
+        self.stats_label = QLabel("Stats: –")
+        bottom = QHBoxLayout(); bottom.addWidget(self.stats_label)
+
+        # Root for advanced page
+        adv_container = QWidget(); root = QVBoxLayout(adv_container)
+        root.addWidget(splitter, 1)
+        root.addLayout(bottom)
+
+        # EZ page
+        ez_container = self._build_ez_page()
+
+        tabs = QTabWidget()
+        tabs.addTab(ez_container, "EZ Mode (Beginner)")
+        tabs.addTab(adv_container, "Advanced Mode")
+        self.setCentralWidget(tabs)
+
+        # Wire up
+        self.detect_btn.clicked.connect(self.on_detect)
+        self.start_btn.clicked.connect(self.on_start)
+        self.cancel_btn.clicked.connect(self.on_cancel)
+        self.finish_odo_btn.clicked.connect(self.on_finish_odo)
+        self.finish_inlb_btn.clicked.connect(self.on_finish_inlb)
+        self.open_folder_btn.clicked.connect(self.on_open_folder)
+        self.retry_one_btn.clicked.connect(self.on_retry_one)
+        self.retry_extract_btn.clicked.connect(self.on_retry_extraction_failed_from_pref_parallel)
+        self.retry_format_btn.clicked.connect(self.on_retry_formatting_failed_from_pref_parallel)
+        self.rb_all.toggled.connect(self.on_scope_toggle)
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        self.btn_sel_all.clicked.connect(lambda: self.set_all_selection(True))
+        self.btn_sel_none.clicked.connect(lambda: self.set_all_selection(False))
+        self.btn_sel_inv.clicked.connect(self.invert_selection)
+        self.sel_table.verticalHeader().sectionDoubleClicked.connect(self.on_sel_row_header_double_clicked)
+        self.btn_quick_add.clicked.connect(self.on_quick_add)
+        self.cb_custom_files.toggled.connect(self.on_file_slice_toggle)
+        QtLogBridge.instance().log_signal.connect(self.on_log_line)
+        QtLogBridge.instance().log_signal.connect(self.on_ez_log_line)
+
+        # registry buttons
+        self.btn_reg_scan.clicked.connect(self.on_scan_picos)
+        self.btn_reg_scan_teensy.clicked.connect(self.on_scan_teensy)
+        self.btn_reg_add.clicked.connect(self.on_reg_add_row)
+        self.btn_reg_add_detected.clicked.connect(self.on_reg_add_from_detected)
+        self.btn_reg_del.clicked.connect(self.on_reg_delete_row)
+        self.btn_reg_save.clicked.connect(self.on_reg_save)
+        self.btn_reg_popup.clicked.connect(self._open_registry_window)
+
+        # Init
+        self.populate_registry_table_from_file()
+        self.on_detect()
+        self._refresh_ez_boards()
+        self._timer.start()
+        self._prog_timer.start()
+        self.on_scope_toggle()
+        self.update_data_option_visibility()
+        self._animate_progress_to(0)
+
+    # Menubar
+    def _build_menubar(self):
+        menubar = QMenuBar(self)
+        self.setMenuBar(menubar)
+
+        mode_menu = menubar.addMenu("Mode")
+        for key, label in self.MODES:
+            act = QAction(label, self)
+            act.triggered.connect(lambda _, k=key: self._set_mode_from_menu(k))
+            mode_menu.addAction(act)
+
+        file_menu = menubar.addMenu("File")
+        act_detect = QAction("Detect Boards", self); act_detect.triggered.connect(self.on_detect)
+        act_start = QAction("Start", self); act_start.triggered.connect(self.on_start)
+        act_cancel = QAction("Cancel", self); act_cancel.triggered.connect(self.on_cancel)
+        act_open = QAction("Open Logs Folder", self); act_open.triggered.connect(self.on_open_folder)
+        act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close)
+        file_menu.addActions([act_detect, act_start, act_cancel, act_open, act_exit])
+
+        tools_menu = menubar.addMenu("Tools")
+        act_scan_pico = QAction("List Pico Serials", self); act_scan_pico.triggered.connect(self.show_pico_list_dialog)
+        act_scan_teensy = QAction("List Teensy Serials", self); act_scan_teensy.triggered.connect(self.show_teensy_list_dialog)
+        tools_menu.addAction(act_scan_pico)
+        tools_menu.addAction(act_scan_teensy)
+
+        view_menu = menubar.addMenu("View")
+        # simple log refresh removed from menu; auto-updated
+
+        adv_menu = menubar.addMenu("Advanced")
+        act_adv = QAction("Advanced Tools…", self); act_adv.triggered.connect(self.show_advanced_tools)
+        adv_menu.addAction(act_adv)
+
+        help_menu = menubar.addMenu("Help")
+        act_about = QAction("About", self)
+        act_about.triggered.connect(lambda: ScrollableAbout(self).exec_())
+        help_menu.addAction(act_about)
+
+    def show_advanced_tools(self):
+        dlg = AdvancedDialog(self)
+        dlg.exec_()
+
+    def show_pico_list_dialog(self):
+        dlg = PicoListDialog(self); dlg.exec_()
+
+    def show_teensy_list_dialog(self):
+        dlg = TeensyListDialog(self); dlg.exec_()
+
+    def _set_mode_from_menu(self, key: str):
+        idx = next((i for i in range(self.mode_combo.count()) if self.mode_combo.itemData(i) == key), -1)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+
+    def _make_card(self, title: str) -> QGroupBox:
+        box = QGroupBox(title)
+        lay = QVBoxLayout()
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(6)
+        box.setLayout(lay)
+        return box
+
+    def on_ez_detect(self) -> None:
+        self.on_detect()
+        self._refresh_ez_boards()
+        self._rebuild_progress_tables()
+
+    def _refresh_ez_boards(self) -> None:
+        try:
+            self.ez_boards_list.clear()
+            self.ez_quick_board.clear()
+            for b in sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n)):
+                self.ez_boards_list.addItem(f"{b} -> {BOARD_PORTS_CURRENT[b]}")
+                self.ez_quick_board.addItem(b, b)
+        except Exception:
+            pass
+        self.ez_rebuild_selection_table(default_checked=True)
+        self.ez_on_scope_toggle()
+
+    def on_ez_action(self, mode: str) -> None:
+        if self.engine_thread and self.engine_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A run is already in progress.")
+            return
+        if not mode:
+            QMessageBox.warning(self, "Select Action", "Choose an action to run."); return
+        if not BOARD_PORTS_CURRENT and mode not in ("ODO", "INLB"):
+            self.on_detect()
+            if not BOARD_PORTS_CURRENT:
+                QMessageBox.warning(self, "No Boards", "No boards detected."); return
+
+        selection = None
+        if self.ez_rb_custom.isChecked():
+            selection = self._selection_from_ez_ui()
+            if not selection:
+                QMessageBox.warning(self, "Selection", "No boards/slots selected."); return
+
+        start_new_run_reset()
+        self.reset_progress_model()
+        self.refresh_views(force_clear=True)
+        self.toggle_controls(False)
+        self.toggle_ez_controls(False)
+
+        self.engine_thread = EngineThread(mode, selection)
+        self.engine_thread.finished_ok.connect(self.on_engine_finished)
+        self.engine_thread.failed.connect(self.on_engine_failed)
+        self.engine_thread.start()
+        try:
+            self.ez_tabs.setCurrentIndex(1)  # switch to Run Status tab
+        except Exception:
+            pass
+
+    def _selection_from_ez_ui(self) -> Optional[Dict[str, Set[int]]]:
+        """Return EZ selection matching advanced selection table behavior."""
+        if getattr(self, "ez_rb_all", None) and self.ez_rb_all.isChecked():
+            return None
+        if not hasattr(self, "ez_sel_table"):
+            return None
+        selection: Dict[str, Set[int]] = {}
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            slots: Set[int] = set()
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded and it.checkState() == Qt.Checked:
+                    slots.add(c + 1)
+            if slots:
+                selection[b] = slots
+        return selection or None
+
+    # EZ mode (beginner) page
+    def _build_ez_page(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(10)
+
+        # Actions as buttons inside a card
+        action_card = self._make_card("ACTIONS")
+        action_card.layout().setContentsMargins(12, 4, 12, 10)
+        action_layout = QGridLayout()
+        action_layout.setSpacing(10)
+        self.ez_btn_extract = QPushButton("EXTRACT PIG DATA")
+        self.ez_btn_format = QPushButton("FORMAT PIG")
+        self.ez_btn_upload = QPushButton("UPLOAD CODE")
+        self.ez_btn_sensor_mfl = QPushButton("CHECK SENSOR VALUES MFL/CMFL")
+        self.ez_btn_sensor_egp = QPushButton("CHECK SENSOR VALUES EGP")
+        self.ez_btn_odo = QPushButton("CONNECT ODOMETER TO PC")
+        self.ez_btn_inlb = QPushButton("CONNECT INLB TO PC")
+        buttons = [
+            self.ez_btn_extract,
+            self.ez_btn_format,
+            self.ez_btn_upload,
+            self.ez_btn_sensor_mfl,
+            self.ez_btn_sensor_egp,
+            self.ez_btn_odo,
+            self.ez_btn_inlb,
+        ]
+        for idx, btn in enumerate(buttons):
+            btn.setMinimumWidth(170)
+            btn.setMinimumHeight(42)
+            r = idx // 3
+            c = idx % 3
+            action_layout.addWidget(btn, r, c)
+        action_card.layout().addLayout(action_layout)
+        action_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        ctrl_row = QHBoxLayout()
+        self.ez_detect_btn = QPushButton("DETECT BOARDS")
+        self.ez_start_btn = QPushButton("Start")
+        self.ez_start_btn.hide()  # start handled by action buttons
+        self.ez_cancel_btn = QPushButton("ABORT")
+        self.ez_open_logs_btn = QPushButton("OPEN LOGS FOLDER")
+        for b in (self.ez_detect_btn, self.ez_open_logs_btn, self.ez_cancel_btn):
+            b.setMinimumWidth(160)
+        ctrl_row.addWidget(self.ez_detect_btn)
+        ctrl_row.addWidget(self.ez_open_logs_btn)
+        ctrl_row.addWidget(self.ez_cancel_btn)
+        ctrl_row.addStretch(1)
+
+        self.ez_progress = QProgressBar(); self.ez_progress.setMinimum(0); self.ez_progress.setMaximum(100); self.ez_progress.setValue(0)
+        self.ez_progress.setMinimumWidth(240)
+
+        # Detected boards card (always visible)
+        boards_card = self._make_card("DETECTED BOARDS")
+        boards_card.layout().setContentsMargins(12, 4, 12, 10)
+        self.ez_boards_list = QListWidget()
+        self.ez_boards_list.setFlow(QListView.LeftToRight)
+        self.ez_boards_list.setWrapping(True)
+        self.ez_boards_list.setResizeMode(QListView.Adjust)
+        self.ez_boards_list.setViewMode(QListView.ListMode)
+        self.ez_boards_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.ez_boards_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.ez_boards_list.setMinimumHeight(110)
+        self.ez_boards_list.setMaximumHeight(150)
+        self.ez_boards_list.setStyleSheet("font-weight: 600;")
+        boards_card.layout().addWidget(self.ez_boards_list)
+        boards_card.setMinimumWidth(320)
+        boards_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+        # Place actions and boards side-by-side
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        action_card.setMinimumWidth(320)
+        top_row.addWidget(action_card, 1)
+        top_row.addWidget(boards_card, 1)
+        v.addLayout(top_row)
+        v.addLayout(ctrl_row)
+        v.addWidget(self.ez_progress)
+
+        # Ribbon content: Selection tab vs Run Status tab
+        self.ez_tabs = QTabWidget()
+        self.ez_tabs.setTabPosition(QTabWidget.North)
+
+        # Selection tab
+        sel_tab = QWidget()
+        sel_layout = QVBoxLayout(sel_tab)
+        sel_layout.setContentsMargins(0, 0, 0, 0)
+        scope_card = self._make_card("SCOPE SELECTION")
+        scope_layout = scope_card.layout()
+        self.ez_rb_all = QRadioButton("All detected boards")
+        self.ez_rb_custom = QRadioButton("Custom selection (Advanced style)")
+        self.ez_rb_all.setChecked(True)
+        for rb in (self.ez_rb_all, self.ez_rb_custom):
+            rb.setStyleSheet("font-weight: 700;")
+        scope_layout.addWidget(self.ez_rb_all)
+        scope_layout.addWidget(self.ez_rb_custom)
+
+        quick_row = QHBoxLayout()
+        self.ez_quick_board = QComboBox()
+        self.ez_quick_slot = QComboBox()
+        for i in range(1, 9):
+            self.ez_quick_slot.addItem(f"S{i}", i)
+        self.ez_btn_quick_add = QPushButton("Add")
+        quick_row.addWidget(QLabel("Quick pick:"))
+        self.ez_quick_board.setMinimumWidth(200)
+        quick_row.addWidget(self.ez_quick_board)
+        quick_row.addWidget(self.ez_quick_slot)
+        quick_row.addWidget(self.ez_btn_quick_add)
+        quick_row.addStretch(1)
+        scope_layout.addLayout(quick_row)
+
+        self.ez_sel_table = QTableWidget(0, 8)
+        self.ez_sel_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.ez_sel_table.verticalHeader().setVisible(True)
+        self.ez_sel_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ez_sel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.ez_sel_table.setMinimumHeight(320)
+        self.ez_sel_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.ez_sel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+        scope_layout.addWidget(QLabel("Custom: select boards and slots (grey = n/a; A- = excluded by registry)"))
+        scope_layout.addWidget(self.ez_sel_table)
+
+        sel_btns = QHBoxLayout()
+        self.ez_btn_sel_all = QPushButton("All")
+        self.ez_btn_sel_none = QPushButton("None")
+        self.ez_btn_sel_inv = QPushButton("Invert")
+        sel_btns.addWidget(self.ez_btn_sel_all)
+        sel_btns.addWidget(self.ez_btn_sel_none)
+        sel_btns.addWidget(self.ez_btn_sel_inv)
+        sel_btns.addStretch(1)
+        scope_layout.addLayout(sel_btns)
+
+        scope_card.setMinimumHeight(430)
+        sel_layout.addWidget(scope_card, 1)
+        self.btn_scope_dialog = QPushButton("OPEN SELECTION WINDOW")
+        sel_layout.addWidget(self.btn_scope_dialog)
+
+        # Run Status tab
+        status_tab = QWidget()
+        status_layout = QHBoxLayout(status_tab)
+        status_layout.setSpacing(14)
+        progress_card = self._make_card("PROGRESS")
+        prog_layout = progress_card.layout()
+        prog_layout.addWidget(QLabel("<b>STATUS</b>  ✅ DONE   ❌ FAIL   ⏳ RUNNING/PENDING   × EXCLUDED   – N/A"))
+        self.ez_progress_table = QTableWidget(0, 8)
+        self.ez_progress_table.setHorizontalHeaderLabels([f"S{i}" for i in range(1, 9)])
+        self.ez_progress_table.verticalHeader().setVisible(True)
+        self.ez_progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ez_progress_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.ez_progress_table.setMinimumHeight(320)
+        self.ez_progress_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        try:
+            self.ez_progress_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            pass
+        prog_layout.addWidget(self.ez_progress_table, 1)
+        progress_card.setMinimumWidth(360)
+
+        summary_card = self._make_card("SUMMARY & LOGS")
+        sum_layout = summary_card.layout()
+        self.ez_simple_text = QTextEdit(); self.ez_simple_text.setReadOnly(True)
+        self.ez_simple_text.setMinimumHeight(60); self.ez_simple_text.setMaximumHeight(80)
+        sum_layout.addWidget(QLabel("Summary (boards/slots):"))
+        sum_layout.addWidget(self.ez_simple_text)
+
+        self.ez_log_text = QTextEdit(); self.ez_log_text.setReadOnly(True)
+        self.ez_log_text.setMinimumHeight(180); self.ez_log_text.setMaximumHeight(260)
+        sum_layout.addWidget(QLabel("Live Log:"))
+        sum_layout.addWidget(self.ez_log_text, 1)
+        summary_card.setMinimumWidth(460)
+        status_layout.addWidget(progress_card, 1)
+        status_layout.addWidget(summary_card, 2)
+
+        sel_scroll = QScrollArea()
+        sel_scroll.setWidget(sel_tab)
+        sel_scroll.setWidgetResizable(True)
+        status_scroll = QScrollArea()
+        status_scroll.setWidget(status_tab)
+        status_scroll.setWidgetResizable(True)
+
+        self.ez_tabs.addTab(sel_scroll, "Selection")
+        self.ez_tabs.addTab(status_scroll, "Run Status")
+        v.addWidget(self.ez_tabs, 1)
+
+        self.ez_detect_btn.clicked.connect(self.on_ez_detect)
+        self.ez_cancel_btn.clicked.connect(self.on_cancel)
+        self.ez_open_logs_btn.clicked.connect(self.on_open_folder)
+        self.ez_rb_all.toggled.connect(self.ez_on_scope_toggle)
+        self.ez_rb_custom.toggled.connect(self.ez_on_scope_toggle)
+        self.ez_btn_sel_all.clicked.connect(lambda: self.ez_set_all_selection(True))
+        self.ez_btn_sel_none.clicked.connect(lambda: self.ez_set_all_selection(False))
+        self.ez_btn_sel_inv.clicked.connect(self.ez_invert_selection)
+        self.ez_btn_quick_add.clicked.connect(self.ez_on_quick_add)
+        self.ez_sel_table.verticalHeader().sectionDoubleClicked.connect(self.ez_on_sel_row_header_double_clicked)
+        self.ez_btn_extract.clicked.connect(lambda: self.on_ez_action("DATA_PREF"))
+        self.ez_btn_format.clicked.connect(lambda: self.on_ez_action("MFL_PREF"))
+        self.ez_btn_upload.clicked.connect(lambda: self.on_ez_action("UPLOAD_CODE"))
+        self.ez_btn_sensor_mfl.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_MFL_CMFL"))
+        self.ez_btn_sensor_egp.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_EGP"))
+        self.ez_btn_odo.clicked.connect(lambda: self.on_ez_action("ODO"))
+        self.ez_btn_inlb.clicked.connect(lambda: self.on_ez_action("INLB"))
+        self.btn_scope_dialog.clicked.connect(self.on_open_scope_dialog)
+
+        outer = QScrollArea()
+        outer.setWidget(w)
+        outer.setWidgetResizable(True)
+        outer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        return outer
+
+    # Animations
+    def _animate_progress_to(self, value: int):
+        value = max(0, min(100, value))
+        self.progress_anim.stop()
+        self.progress_anim.setStartValue(self.progress.value())
+        self.progress_anim.setEndValue(value)
+        self.progress_anim.start()
+
+    def on_mode_changed(self):
+        self.update_data_option_visibility()
+
+    def update_data_option_visibility(self) -> None:
+        is_data_mode = self.mode_combo.currentData() in ("DATA", "DATA_PREF")
+        self.data_opts_group.setVisible(is_data_mode)
+        self.on_file_slice_toggle(self.cb_custom_files.isChecked() and is_data_mode)
+
+    def on_file_slice_toggle(self, checked: bool):
+        enable_fields = checked and (self.mode_combo.currentData() in ("DATA", "DATA_PREF"))
+        for sb in (self.sb_skip, self.sb_take, self.sb_tail):
+            sb.setEnabled(enable_fields)
+
+    def _apply_file_slice_from_ui(self, mode: str) -> None:
+        if mode in ("DATA", "DATA_PREF"):
+            set_file_slice_config(
+                enabled=self.cb_custom_files.isChecked(),
+                offset=self.sb_skip.value(),
+                count=self.sb_take.value(),
+                tail=self.sb_tail.value(),
+            )
+        else:
+            set_file_slice_config(False, 0, 0, 0)
+
+    # Registry UI
+    def populate_registry_table_from_file(self):
+        self._populate_registry_table(self.reg_table)
+        self._highlight_registry_matches(self.reg_table, DETECTED_SERIALS_CURRENT)
+
+    def _populate_registry_table(self, table: QTableWidget) -> None:
+        table.setRowCount(0)
+        serial_to_board = REGISTRY.get("serial_to_board", {})
+        for ser, entry in serial_to_board.items():
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(ser))
+            table.setItem(r, 1, QTableWidgetItem(entry.get("name", "")))
+            table.setItem(r, 2, QTableWidgetItem(entry.get("type", "C-MFL")))
+            pipe_val = entry.get("pipe_size", "")
+            table.setItem(r, 3, QTableWidgetItem(str(pipe_val) if pipe_val not in (None, "") else ""))
+            excl = entry.get("exclude", "")
+            if isinstance(excl, list):
+                excl_str = ", ".join(str(x) for x in excl)
+            else:
+                excl_str = str(excl or "")
+            table.setItem(r, 4, QTableWidgetItem(excl_str))
+            total_slots = entry.get("total_slots", default_total_slots_for_type(entry.get("type", "C-MFL")))
+            table.setItem(r, 5, QTableWidgetItem(str(total_slots)))
+        table.resizeColumnsToContents()
+
+    def _highlight_registry_matches(self, table: QTableWidget, detected_serials: Set[str]) -> None:
+        base_color = table.palette().base().color()
+        highlight_color = QColor("#d1fae5")
+        for row in range(table.rowCount()):
+            serial_item = table.item(row, 0)
+            if not serial_item:
+                serial_item = QTableWidgetItem("")
+                table.setItem(row, 0, serial_item)
+            match = serial_item.text().strip() in detected_serials
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    table.setItem(row, col, item)
+                item.setBackground(highlight_color if match else base_color)
+
+    def on_reg_add_row(self):
+        self._reg_add_row(self.reg_table)
+
+    def on_reg_delete_row(self):
+        self._reg_delete_row(self.reg_table)
+
+    def on_reg_add_from_detected(self):
+        self._reg_add_from_detected(self.reg_table)
+
+    def on_reg_save(self):
+        if self._reg_save_table(self.reg_table):
+            QMessageBox.information(self, "Registry", "Saved. Re-detecting boards.")
+            self.on_detect()
+
+    def on_scan_picos(self):
+        self.show_pico_list_dialog()
+
+    def on_scan_teensy(self):
+        self.show_teensy_list_dialog()
+
+    # Registry helpers (shared with pop-out dialog)
+    def _reg_add_row(self, table: QTableWidget):
+        r = table.rowCount()
+        table.insertRow(r)
+        table.setItem(r, 0, QTableWidgetItem(""))
+        table.setItem(r, 1, QTableWidgetItem(f"Board_{r+1}"))
+        table.setItem(r, 2, QTableWidgetItem("C-MFL"))
+        table.setItem(r, 3, QTableWidgetItem(""))
+        table.setItem(r, 4, QTableWidgetItem(""))
+        table.setItem(r, 5, QTableWidgetItem("8"))
+
+    def _reg_delete_row(self, table: QTableWidget):
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+
+    def _reg_add_from_detected(self, table: QTableWidget):
+        present_serials = set()
+        for i in range(table.rowCount()):
+            s = table.item(i,0)
+            if s: present_serials.add(s.text().strip())
+        added = 0
+        for port in serial.tools.list_ports.comports():
+            serno = getattr(port, "serial_number", None)
+            if not serno: continue
+            if serno in present_serials: continue
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(serno))
+            table.setItem(r, 1, QTableWidgetItem(f"Board_{serno[-4:]}"))
+            t = "EGP" if "EGP" in (port.description or "").upper() else "C-MFL"
+            table.setItem(r, 2, QTableWidgetItem(t))
+            table.setItem(r, 3, QTableWidgetItem(""))
+            table.setItem(r, 4, QTableWidgetItem(""))
+            table.setItem(r, 5, QTableWidgetItem(str(default_total_slots_for_type(t))))
+            added += 1
+        if added == 0:
+            QMessageBox.information(self, "Registry", "No new connected serials found.")
+
+    def _reg_save_table(self, table: QTableWidget) -> bool:
+        serial_to_board: Dict[str, Dict] = {}
+        for i in range(table.rowCount()):
+            s_item = table.item(i,0); n_item = table.item(i,1); t_item = table.item(i,2); p_item = table.item(i,3); e_item = table.item(i,4); ts_item = table.item(i,5)
+            serial = (s_item.text().strip() if s_item else "")
+            name = (n_item.text().strip() if n_item else "")
+            btype = (t_item.text().strip().upper() if t_item else "C-MFL")
+            pipe_raw = (p_item.text().strip() if p_item else "")
+            excl_raw = (e_item.text().strip() if e_item else "")
+            total_slots_raw = (ts_item.text().strip() if ts_item else "")
+            if not serial or not name:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Serial and Name are required.")
+                return False
+            if btype not in self.BOARD_TYPES:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Type must be one of {', '.join(self.BOARD_TYPES)}.")
+                return False
+            if pipe_raw:
+                if not pipe_raw.isdigit():
+                    QMessageBox.warning(self, "Registry", f"Row {i+1}: Pipe size must be an integer (inches).")
+                    return False
+                pipe_size = int(pipe_raw)
+            else:
+                pipe_size = 0
+            if total_slots_raw not in {"5", "8"}:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Total Slots must be either 5 or 8.")
+                return False
+            total_slots = int(total_slots_raw)
+            try:
+                excl = {int(x) for x in re.split(r"[,\s]+", excl_raw) if x.strip().isdigit()}
+            except Exception:
+                excl = set()
+            slot_cap = 0 if name.strip().upper() in {"ODO", "INLB"} else total_slots
+            invalid_excl = sorted(s for s in excl if s < 1 or s > slot_cap)
+            if invalid_excl:
+                QMessageBox.warning(self, "Registry", f"Row {i+1}: Exclude Slots contains invalid values for a {slot_cap}-slot board: {', '.join(str(x) for x in invalid_excl)}.")
+                return False
+            serial_to_board[serial] = {"name": name, "type": btype, "pipe_size": pipe_size, "exclude": sorted(excl), "total_slots": total_slots}
+        REGISTRY["version"] = 4
+        REGISTRY["serial_to_board"] = serial_to_board
+        save_registry(REGISTRY)
+        return True
+
+    def _open_registry_window(self):
+        dlg = RegistryDialog(self)
+        dlg.exec_()
+
+    # UI actions
+    def on_detect(self) -> None:
+        global BOARD_PORTS_CURRENT, SENSOR_CHECK_SAFELOCK_PORTS
+        BOARD_PORTS_CURRENT = detect_boards()
+        SENSOR_CHECK_SAFELOCK_PORTS = {_norm_port(p) for p in BOARD_PORTS_CURRENT.values()}
+        self._board_order = sorted(BOARD_PORTS_CURRENT.keys(), key=lambda n: (board_index(n), n))
+        self.boards_list.clear()
+        for b in self._board_order:
+            self.boards_list.addItem(f"{b}  [{get_board_type(b)}]  ->  {BOARD_PORTS_CURRENT[b]}")
+        self.rebuild_progress_table()
+        self.rebuild_selection_table(default_checked=True)
+        self.reset_progress_model()
+        self.quick_board.clear()
+        for b in self._board_order:
+            self.quick_board.addItem(b, b)
+        self._highlight_registry_matches(self.reg_table, DETECTED_SERIALS_CURRENT)
+
+    def on_start(self) -> None:
+        if self.engine_thread and self.engine_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A run is already in progress.")
+            return
+        mode = self.mode_combo.currentData()
+        if not mode:
+            QMessageBox.warning(self, "Select Mode", "Choose a mode."); return
+        if not BOARD_PORTS_CURRENT and mode not in ("ODO", "INLB"):
+            self.on_detect()
+            if not BOARD_PORTS_CURRENT:
+                QMessageBox.warning(self, "No Boards", "No boards detected."); return
+
+        selection = None
+        if self.rb_custom.isChecked() and mode not in ("ODO", "INLB"):
+            selection = self.collect_selection()
+            if not selection:
+                QMessageBox.warning(self, "Selection", "No boards/slots selected."); return
+
+        self._apply_file_slice_from_ui(mode)
+
+        # Fresh status/summary at each start
+        start_new_run_reset()
+        self.reset_progress_model()
+        self.refresh_views(force_clear=True)
+
+        self.toggle_controls(False)
+        self.clear_session_ui_tables_only()
+        self.engine_thread = EngineThread(mode, selection)
+        self.engine_thread.finished_ok.connect(self.on_engine_finished)
+        self.engine_thread.failed.connect(self.on_engine_failed)
+        self.engine_thread.start()
+
+    def on_cancel(self) -> None:
+        CANCEL_EVENT.set()
+        log("[CANCEL] Requested. Workers will stop soon.")
+
+    def on_finish_odo(self) -> None:
+        process_finish_odo()
+        self.refresh_views()
+        self.load_simple_log()
+
+    def on_finish_inlb(self) -> None:
+        process_finish_inlb()
+        self.refresh_views()
+        self.load_simple_log()
+
+    def on_engine_finished(self) -> None:
+        self.toggle_controls(True)
+        self.toggle_ez_controls(True)
+        self.refresh_views()
+        self.load_simple_log()
+        self.refresh_progress(finalize=True)
+
+    def on_engine_failed(self, err: str) -> None:
+        self.toggle_controls(True)
+        self.toggle_ez_controls(True)
+        self.refresh_views()
+        self.load_simple_log()
+        self.refresh_progress(finalize=True)
+        QMessageBox.critical(self, "Run Failed", f"Engine error:\n{err}")
+
+    def on_open_folder(self) -> None:
+        try:
+            path = LOG_DIR
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # nosec
+            elif sys.platform == "darwin":
+                subprocess.call(["open", path])
+            else:
+                subprocess.call(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "Open Folder", f"Failed to open logs folder:\n{e}")
+
+    def on_retry_one(self) -> None:
+        if self.retry_thread and self.retry_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A retry is already running.")
+            return
+        try:
+            bno = int(self.board_no_in.text().strip())
+            sno = int(self.slot_no_in.text().strip())
+        except Exception:
+            QMessageBox.warning(self, "Input", "Enter valid integers for Board No and Slot No.")
+            return
+        board = find_board_name_by_index(bno)
+        lim = get_slot_limit(board)
+        if not (1 <= sno <= max(1, lim)):
+            QMessageBox.warning(self, "Input", f"Slot No must be 1–{lim} for {board} ({get_board_type(board)}).")
+            return
+        if sno in BOARD_EXCLUDE_SLOTS.get(board, set()):
+            QMessageBox.information(self, "Excluded", f"Slot {sno} is excluded for {board}.")
+            return
+        mode = MODE_CURRENT or self.mode_combo.currentData()
+        self.retry_thread = RetryThread(tasks=[(board, sno)], mode=mode)
+        self.retry_thread.finished_ok.connect(self.on_retry_finished)
+        self.retry_thread.failed.connect(self.on_retry_failed)
+        self.retry_thread.start()
+
+    # Parallel re-run for failed from Mode 8 -> run Mode 1
+    def on_retry_extraction_failed_from_pref_parallel(self) -> None:
+        if self.engine_thread and self.engine_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A run is already in progress.")
+            return
+        if MODE_CURRENT != "DATA_PREF":
+            QMessageBox.information(self, "Retry Extraction", "This action only targets failures from the last Mode 8 run.")
+            return
+        snap = TRACKER.snapshot()
+        selection: Dict[str, Set[int]] = {}
+        for b, slots in snap.items():
+            lim = get_slot_limit(b)
+            if lim <= 0:
+                continue
+            for s, phases in slots.items():
+                try:
+                    s_int = int(s)
+                except Exception:
+                    continue
+                if s_int < 1 or s_int > lim:
+                    continue
+                if s_int in BOARD_EXCLUDE_SLOTS.get(b, set()):
+                    continue
+                done = StatusTracker.slot_done("DATA_PREF", phases if isinstance(phases, dict) else {})
+                if not done:
+                    selection.setdefault(b, set()).add(s_int)
+        if not selection:
+            QMessageBox.information(self, "Retry Extraction", "No failed slots found from the last Mode 8 run.")
+            return
+        self.engine_thread = EngineThread("DATA", selection)
+        self.engine_thread.finished_ok.connect(self.on_engine_finished)
+        self.engine_thread.failed.connect(self.on_engine_failed)
+        self.engine_thread.start()
+
+    # Parallel re-run for failed from Mode 9 -> run Mode 2
+    def on_retry_formatting_failed_from_pref_parallel(self) -> None:
+        if self.engine_thread and self.engine_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "A run is already in progress.")
+            return
+        if MODE_CURRENT != "MFL_PREF":
+            QMessageBox.information(self, "Retry Formatting", "This action only targets failures from the last Mode 9 run.")
+            return
+        snap = TRACKER.snapshot()
+        selection: Dict[str, Set[int]] = {}
+        for b, slots in snap.items():
+            lim = get_slot_limit(b)
+            if lim <= 0:
+                continue
+            for s, phases in slots.items():
+                try:
+                    s_int = int(s)
+                except Exception:
+                    continue
+                if s_int < 1 or s_int > lim:
+                    continue
+                if s_int in BOARD_EXCLUDE_SLOTS.get(b, set()):
+                    continue
+                done = StatusTracker.slot_done("MFL_PREF", phases if isinstance(phases, dict) else {})
+                if not done:
+                    selection.setdefault(b, set()).add(s_int)
+        if not selection:
+            QMessageBox.information(self, "Retry Formatting", "No failed slots found from the last Mode 9 run.")
+            return
+        self.engine_thread = EngineThread("MFL", selection)
+        self.engine_thread.finished_ok.connect(self.on_engine_finished)
+        self.engine_thread.failed.connect(self.on_engine_failed)
+        self.engine_thread.start()
+
+    def on_retry_finished(self) -> None:
+        self.refresh_views()
+        self.load_simple_log()
+
+    def on_retry_failed(self, err: str) -> None:
+        self.refresh_views()
+        self.load_simple_log()
+        QMessageBox.critical(self, "Retry Failed", f"Retry error:\n{err}")
+
+    # Quick add
+    def on_quick_add(self):
+        if not self._board_order:
+            return
+        self.rb_custom.setChecked(True)
+        board = self.quick_board.currentData()
+        lim = get_slot_limit(board)
+        slot = int(self.quick_slot.currentData())
+        if slot > lim:
+            QMessageBox.information(self, "Limit", f"{board} ({get_board_type(board)}) has only {lim} slots.")
+            return
+        if slot in BOARD_EXCLUDE_SLOTS.get(board, set()):
+            QMessageBox.information(self, "Excluded", f"{board} slot {slot} is excluded.")
+            return
+        try:
+            row = self._board_order.index(board)
+            col = slot - 1
+            itm = self.sel_table.item(row, col)
+            if itm is None:
+                itm = QTableWidgetItem(); itm.setFlags(itm.flags() | Qt.ItemIsUserCheckable)
+                self.sel_table.setItem(row, col, itm)
+            itm.setCheckState(Qt.Checked)
+        except ValueError:
+            pass
+
+    # Selection helpers/UI
+    def on_scope_toggle(self) -> None:
+        custom = self.rb_custom.isChecked()
+        self.sel_table.setEnabled(custom)
+        self.btn_sel_all.setEnabled(custom)
+        self.btn_sel_none.setEnabled(custom)
+        self.btn_sel_inv.setEnabled(custom)
+        self.quick_board.setEnabled(custom)
+        self.quick_slot.setEnabled(custom)
+        self.btn_quick_add.setEnabled(custom)
+
+    def rebuild_selection_table(self, default_checked: bool = True) -> None:
+        self.sel_table.setRowCount(len(self._board_order))
+        for r, b in enumerate(self._board_order):
+            self.sel_table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                item = QTableWidgetItem()
+                if c < lim:
+                    if (c+1) in excluded:
+                        item.setFlags(Qt.ItemIsEnabled)
+                        item.setText("×")
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        item.setCheckState(Qt.Checked if default_checked else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsEnabled)
+                    item.setText("–")
+                self.sel_table.setItem(r, c, item)
+        self.sel_table.resizeColumnsToContents()
+
+    def set_all_selection(self, checked: bool) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def invert_selection(self) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+
+    def on_sel_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._board_order):
+            return
+        board = self._board_order[row]
+        lim = get_slot_limit(board)
+        excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excluded:
+                continue
+            it = self.sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
+    def collect_selection(self) -> Dict[str, Set[int]]:
+        selection: Dict[str, Set[int]] = {}
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            slots: Set[int] = set()
+            for c in range(8):
+                it = self.sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded and it.checkState() == Qt.Checked:
+                    slots.add(c + 1)
+            if slots:
+                selection[b] = slots
+        return selection
+
+    # EZ selection helpers (mirrors advanced selection behavior)
+    def ez_on_scope_toggle(self) -> None:
+        custom = self.ez_rb_custom.isChecked()
+        self.ez_sel_table.setEnabled(custom)
+        self.ez_btn_sel_all.setEnabled(custom)
+        self.ez_btn_sel_none.setEnabled(custom)
+        self.ez_btn_sel_inv.setEnabled(custom)
+        self.ez_quick_board.setEnabled(custom)
+        self.ez_quick_slot.setEnabled(custom)
+        self.ez_btn_quick_add.setEnabled(custom)
+
+    def ez_rebuild_selection_table(self, default_checked: bool = True) -> None:
+        if not hasattr(self, "ez_sel_table"):
+            return
+        self.ez_sel_table.setRowCount(len(self._board_order))
+        for r, b in enumerate(self._board_order):
+            self.ez_sel_table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                item = QTableWidgetItem()
+                if c < lim:
+                    if (c+1) in excluded:
+                        item.setFlags(Qt.ItemIsEnabled)
+                        item.setText("×")
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        item.setCheckState(Qt.Checked if default_checked else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsEnabled)
+                    item.setText("–")
+                self.ez_sel_table.setItem(r, c, item)
+        try:
+            self.ez_sel_table.resizeColumnsToContents()
+        except Exception:
+            pass
+
+    def ez_set_all_selection(self, checked: bool) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def ez_invert_selection(self) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                it = self.ez_sel_table.item(r, c)
+                if it and c < lim and (c+1) not in excluded:
+                    it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+
+    def ez_on_sel_row_header_double_clicked(self, row: int) -> None:
+        if row < 0 or row >= len(self._board_order):
+            return
+        board = self._board_order[row]
+        lim = get_slot_limit(board)
+        excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+        items = []
+        checked = 0
+        total = 0
+        for c in range(8):
+            if c >= lim or (c+1) in excluded:
+                continue
+            it = self.ez_sel_table.item(row, c)
+            if not it:
+                continue
+            total += 1
+            if it.checkState() == Qt.Checked:
+                checked += 1
+            items.append(it)
+        if not total:
+            return
+        target = Qt.Unchecked if checked == total else Qt.Checked
+        for it in items:
+            it.setCheckState(target)
+
+    def ez_on_quick_add(self):
+        if not self._board_order:
+            return
+        self.ez_rb_custom.setChecked(True)
+        board = self.ez_quick_board.currentData()
+        lim = get_slot_limit(board)
+        slot = int(self.ez_quick_slot.currentData())
+        if slot > lim:
+            QMessageBox.information(self, "Limit", f"{board} ({get_board_type(board)}) has only {lim} slots.")
+            return
+        if slot in BOARD_EXCLUDE_SLOTS.get(board, set()):
+            QMessageBox.information(self, "Excluded", f"{board} slot {slot} is excluded.")
+            return
+        try:
+            row = self._board_order.index(board)
+            col = slot - 1
+            itm = self.ez_sel_table.item(row, col)
+            if itm is None:
+                itm = QTableWidgetItem(); itm.setFlags(itm.flags() | Qt.ItemIsUserCheckable)
+                self.ez_sel_table.setItem(row, col, itm)
+            itm.setCheckState(Qt.Checked)
+        except ValueError:
+            pass
+
+    def ez_apply_selection(self, selection: Optional[Dict[str, Set[int]]]) -> None:
+        """Apply selection onto EZ table (all checked if None)."""
+        if not hasattr(self, "ez_sel_table"):
+            return
+        default_checked = selection is None
+        self.ez_rebuild_selection_table(default_checked=default_checked)
+        if selection is None:
+            self.ez_rb_all.setChecked(True)
+            return
+        self.ez_rb_custom.setChecked(True)
+        for b, slots in selection.items():
+            if b not in self._board_order:
+                continue
+            r = self._board_order.index(b)
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for s in slots:
+                c = s - 1
+                if 0 <= c < 8 and s <= lim and s not in excluded:
+                    it = self.ez_sel_table.item(r, c)
+                    if it:
+                        it.setCheckState(Qt.Checked)
+
+    # UI helpers
+    def toggle_controls(self, enabled: bool) -> None:
+        self.mode_combo.setEnabled(enabled)
+        self.detect_btn.setEnabled(enabled)
+        self.start_btn.setEnabled(enabled)
+        self.cancel_btn.setEnabled(not enabled or True)  # cancel stays enabled during run
+        self.finish_odo_btn.setEnabled(enabled)
+        self.finish_inlb_btn.setEnabled(enabled)
+        self.rb_all.setEnabled(enabled)
+        self.rb_custom.setEnabled(enabled)
+        self.on_scope_toggle()
+        self.btn_reg_add.setEnabled(enabled)
+        self.btn_reg_add_detected.setEnabled(enabled)
+        self.btn_reg_del.setEnabled(enabled)
+        self.btn_reg_save.setEnabled(enabled)
+        self.btn_reg_scan.setEnabled(enabled)
+        self.btn_reg_scan_teensy.setEnabled(enabled)
+        self.btn_reg_popup.setEnabled(enabled)
+
+    def toggle_ez_controls(self, enabled: bool) -> None:
+        try:
+            self.ez_detect_btn.setEnabled(enabled)
+            self.ez_cancel_btn.setEnabled(not enabled or True)
+            for btn in (
+                self.ez_btn_extract,
+                self.ez_btn_format,
+                self.ez_btn_upload,
+                self.ez_btn_sensor_mfl,
+                self.ez_btn_sensor_egp,
+                self.ez_btn_odo,
+                self.ez_btn_inlb,
+            ):
+                btn.setEnabled(enabled)
+        except Exception:
+            pass
+
+    def clear_session_ui_tables_only(self) -> None:
+        self.log_text.clear()
+        self.simple_text.clear()
+        self.refresh_views(force_clear=True)
+
+    def rebuild_progress_table(self) -> None:
+        self._setup_progress_table(self.table)
+        try:
+            self._setup_progress_table(self.ez_progress_table)
+        except Exception:
+            pass
+
+    def refresh_views(self, force_clear: bool = False) -> None:
+        snap = TRACKER.snapshot()
+        mode = MODE_CURRENT or self.mode_combo.currentData()
+        self._refresh_progress_table(self.table, snap, mode)
+        try:
+            self._refresh_progress_table(self.ez_progress_table, snap, mode)
+        except Exception:
+            pass
+
+        if mode:
+            s = TRACKER.summarize(mode)
+            summary_text = f"Boards {s['boards_ok']}/{s['boards_total']} ok | Slots {s['slots_ok']}/{s['slots_total']} ok | Fail {s['slots_fail']}"
+            self.stats_label.setText(summary_text)
+            self._update_ez_summary(s)
+
+    def _setup_progress_table(self, table: QTableWidget) -> None:
+        table.setRowCount(len(self._board_order))
+        for r, b in enumerate(self._board_order):
+            table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            for c in range(8):
+                sym = "–"
+                if c < lim:
+                    sym = "×" if (c+1) in excluded else "⏳"
+                item = QTableWidgetItem(sym)
+                item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(r, c, item)
+        table.resizeColumnsToContents()
+
+    def _refresh_progress_table(self, table: QTableWidget, snap: Dict[str, Dict], mode: Optional[str]) -> None:
+        for r, b in enumerate(self._board_order):
+            lim = get_slot_limit(b)
+            excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
+            phases_by_slot = snap.get(b, {})
+            for c in range(8):
+                item = table.item(r, c)
+                if c >= lim:
+                    if item: item.setText("–")
+                    continue
+                if (c+1) in excluded:
+                    if item: item.setText("×")
+                    continue
+                slot = c+1
+                phases = phases_by_slot.get(str(slot), {})
+                sym = "⏳"
+                if phases:
+                    if StatusTracker.slot_done(mode or "", phases):
+                        sym = "✅"
+                    elif any(rec.get("status") == "failed" for rec in phases.values()):
+                        sym = "❌"
+                    elif any(rec.get("status") == "running" for rec in phases.values()):
+                        sym = "⏳"
+                if item is None:
+                    item = QTableWidgetItem(sym)
+                    table.setItem(r, c, item)
+                else:
+                    item.setText(sym)
+                item.setTextAlignment(Qt.AlignCenter)
+        table.resizeColumnsToContents()
+
+    def _rebuild_progress_tables(self) -> None:
+        self._setup_progress_table(self.table)
+        try:
+            self._setup_progress_table(self.ez_progress_table)
+        except Exception:
+            pass
+
+    def reset_progress_model(self):
+        global PROG_TOTAL_SLOTS, PROG_SLOTS_DONE
+        PROG_TOTAL_SLOTS = 0
+        PROG_SLOTS_DONE = set()
+        self._animate_progress_to(0)
+        try:
+            self.ez_progress.setValue(0)
+        except Exception:
+            pass
+
+    def _update_ez_summary(self, summary: Optional[Dict[str, object]]) -> None:
+        try:
+            if not summary:
+                self.ez_simple_text.clear()
+                return
+            boards_line = f"<b style='color:#1d4ed8;'>BOARDS</b>: {summary.get('boards_ok',0)}/{summary.get('boards_total',0)} OK"
+            slots_line = f"<b style='color:#1d4ed8;'>SLOTS</b>: {summary.get('slots_ok',0)}/{summary.get('slots_total',0)} OK"
+            fail_line = f"<b style='color:#ef4444;'>FAIL</b>: {summary.get('slots_fail',0)}"
+            html = f"{boards_line} &nbsp;|&nbsp; {slots_line} &nbsp;|&nbsp; {fail_line}"
+            self.ez_simple_text.setHtml(html)
+        except Exception:
+            pass
+
+    def on_open_scope_dialog(self):
+        dlg = ScopeDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            sel = dlg.selected_scope()
+            self.ez_apply_selection(sel)
+            self.ez_on_scope_toggle()
+
+    def refresh_progress(self, finalize: bool=False):
+        if PROG_TOTAL_SLOTS <= 0:
+            self._animate_progress_to(0); return
+        processed = len(PROG_SLOTS_DONE)
+        target = int((processed / PROG_TOTAL_SLOTS) * 100)
+        if finalize:
+            target = 100
+        if target != self.progress.value():
+            self._animate_progress_to(target)
+        try:
+            if self.ez_progress.value() != target:
+                self.ez_progress.setValue(target)
+        except Exception:
+            pass
+
+    def load_simple_log(self) -> None:
+        try:
+            if os.path.exists(SIMPLE_LOG):
+                with open(SIMPLE_LOG, "r", encoding="utf-8") as f:
+                    self.simple_text.setPlainText(f.read())
+        except Exception as e:
+            self.simple_text.setPlainText(f"Failed to load simple log: {e}")
+
+    def on_log_line(self, line: str) -> None:
+        self.log_text.append(line)
+
+    def on_ez_log_line(self, line: str) -> None:
+        try:
+            self.ez_log_text.append(line)
+        except Exception:
+            pass
+
+# ---------------------------- CLI ----------------------------
+def main_cli() -> None:
+    print("CLI runs on all registry-detected boards/slots.")
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF,15=CHECK_SENSOR_MFL_CMFL,16=CHECK_SENSOR_EGP): ").strip()
+    opt_map = {
+        "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
+        "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
+        "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF","14":"LABEL_PREF",
+        "15":"CHECK_SENSOR_MFL_CMFL","16":"CHECK_SENSOR_EGP"
+    }
+    mode = opt_map.get(choice, "INVALID")
+    if mode == "INVALID":
+        print("Invalid choice."); return
+    process_all_boards_with_selection(mode, selection=None)
+
+# ---------------------------- GUI ENTRY ----------------------------
+def main() -> None:
+    app = QApplication(sys.argv)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        main_cli()
+    else:
+        main()

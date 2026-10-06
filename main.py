@@ -21,7 +21,10 @@ import atexit
 import traceback
 from datetime import datetime
 import re
-from typing import Optional, Dict, Set, List, Tuple
+from typing import Callable, Optional, Dict, Set, List, Tuple
+
+from extraction_paths import build_by_label_destination
+from extraction_progress import estimate_eta_seconds, extraction_percent, format_eta
 
 # ---------------------------- CONFIG PATH ----------------------------
 def get_config_path() -> str:
@@ -121,6 +124,20 @@ SENSOR_CHECK_PORT_APPEAR_SECONDS = 3.0
 SENSOR_CHECK_AFTER_SELECT_DELAY_SECONDS = 0.75
 SENSOR_CHECK_BETWEEN_SLOTS_SECONDS = 1.5
 SENSOR_CHECK_EXPECTED_TMAGS = tuple(range(8))
+POWER_OFF_SLOT_COMMANDS: Dict[int, str] = {
+    1: "26",
+    2: "27",
+    3: "28",
+    4: "29",
+    5: "30",
+    6: "31",
+    7: "32",
+    8: "40",
+}
+
+def power_off_command_for_slot(slot: int) -> Optional[str]:
+    return POWER_OFF_SLOT_COMMANDS.get(int(slot))
+
 TMAG_LINE_RE = re.compile(
     r"\btmag\s*([0-7])\b.*?\bx\s*[:=]?\s*(-?\d+(?:\.\d+)?).*?\by\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
@@ -243,6 +260,8 @@ class StatusTracker:
             return g("mfl_upload") == "success"
         if option_mode in ("CHECK_SENSOR_MFL_CMFL", "CHECK_SENSOR_EGP"):
             return g("sensor_check") == "success"
+        if option_mode == "POWER_OFF_ALL":
+            return g("power_off") == "success"
         if option_mode == "AUTO_FORMAT_BURN":
             return g("format") == "success" and g("mfl_upload") == "success"
         if option_mode == "AUTO_FORMAT_BURN_EGP":
@@ -429,6 +448,26 @@ def mark_and_update(board: str, slot: int, phase: str, status: str, err: str = "
     except Exception:
         pass
 
+def update_copy_progress(board: str, slot: int, copied_bytes: int, total_bytes: int) -> None:
+    """Publish byte progress without rewriting logs for every copied chunk."""
+    TRACKER.update_phase_fields(board, slot, "copy", {
+        "copied_bytes": max(0, int(copied_bytes)),
+        "total_bytes": max(0, int(total_bytes)),
+        "progress_percent": extraction_percent(copied_bytes, total_bytes),
+    })
+
+def phase_error(board: str, slot: int, phase: str) -> str:
+    rec = TRACKER.snapshot().get(board, {}).get(str(slot), {}).get(phase, {}) or {}
+    return str(rec.get("err") or "")
+
+def boot_failure_summary(board: str, slot: int) -> str:
+    err = phase_error(board, slot, "boot_data")
+    if err in {"bootloader not detected", "boot failed"}:
+        return "boot failed"
+    if err:
+        return f"boot failed: {err}"
+    return "boot failed"
+
 def mark_sensor_check(
     board: str,
     slot: int,
@@ -455,6 +494,12 @@ def set_progress_total_from_selected(selected_boards: List[Tuple[str, str]], sel
         PROG_TOTAL_SLOTS = max(1, total)
     else:
         PROG_TOTAL_SLOTS = max(1, sum(get_slot_limit(b) for b, _ in selected_boards))
+    PROG_SLOTS_DONE = set()
+
+def set_progress_total_for_power_off(selected_boards: List[Tuple[str, str]], selection: Optional[Dict[str, Set[int]]]) -> None:
+    global PROG_TOTAL_SLOTS, PROG_SLOTS_DONE
+    total = sum(len(selected_power_off_slots_for(b, selection)) for b, _ in selected_boards)
+    PROG_TOTAL_SLOTS = max(1, total)
     PROG_SLOTS_DONE = set()
 
 def start_new_run_reset():
@@ -519,6 +564,26 @@ def get_slot_limit(board_name: str) -> int:
     if slots in (5, 8):
         return slots
     return default_total_slots_for_type(get_board_type(board_name))
+
+def get_extraction_destination(board_name: str, slot: int, volume_label: str = "") -> str:
+    """Return the type/size/label-aware destination for extracted slot data."""
+    return build_by_label_destination(
+        LOG_DIR,
+        get_board_type(board_name),
+        BOARD_PIPE_SIZES.get(board_name, 0),
+        board_index(board_name),
+        slot,
+        volume_label,
+    )
+
+def is_slot_selected_for_current_run(board_name: str, slot: int) -> bool:
+    """Return whether a valid slot is included in the active run selection."""
+    if RUN_SELECTION is None:
+        return True
+    try:
+        return int(slot) in {int(s) for s in RUN_SELECTION.get(board_name, set())}
+    except Exception:
+        return False
 
 def find_board_name_by_index(idx: int) -> str:
     target_default = f"Board_{idx}"
@@ -1013,13 +1078,22 @@ def upload_uf2_to_all_rp2(uf2_path: str) -> Tuple[int, int, List[str]]:
     return ok, fail, msgs
 
 # ---------------------------- FILE COPY ----------------------------
-def copy_file_with_progress(src: str, dest: str, retries: int = 3, delay: float = 1.0) -> bool:
+def copy_file_with_progress(
+    src: str,
+    dest: str,
+    retries: int = 3,
+    delay: float = 1.0,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> bool:
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     for attempt in range(retries):
         if CANCEL_EVENT.is_set():
             return False
         try:
             total_size = os.path.getsize(src)
+            copied_size = 0
+            if progress_callback:
+                progress_callback(0, total_size)
             with open(src, "rb") as fsrc, open(dest, "wb") as fdst, tqdm(
                 total=total_size, unit="B", unit_scale=True,
                 desc=f"Copying {os.path.basename(src)}", ascii=True) as pbar:
@@ -1030,7 +1104,10 @@ def copy_file_with_progress(src: str, dest: str, retries: int = 3, delay: float 
                     if not buf:
                         break
                     fdst.write(buf)
+                    copied_size += len(buf)
                     pbar.update(len(buf))
+                    if progress_callback:
+                        progress_callback(copied_size, total_size)
             log(f"[COPIED] {src} -> {dest}")
             return True
         except Exception as e:
@@ -1143,6 +1220,22 @@ def copy_sdcard_files(src_drive: str, dest_folder: str, board: str, slot: int, m
             mark_and_update(board, slot, "copy", "failed", reason)
             return False
 
+        file_sizes: Dict[str, int] = {}
+        for name in files:
+            try:
+                file_sizes[name] = max(0, os.path.getsize(os.path.join(src_drive, name)))
+            except OSError:
+                file_sizes[name] = 0
+        total_bytes = sum(file_sizes.values())
+        completed_bytes = 0
+        TRACKER.update_phase_fields(board, slot, "copy", {
+            "copy_started_at": time.time(),
+            "copied_bytes": 0,
+            "total_bytes": total_bytes,
+            "progress_percent": 0,
+        })
+        update_copy_progress(board, slot, 0, total_bytes)
+
         os.makedirs(dest_folder, exist_ok=True)
         time.sleep(1.0)
 
@@ -1152,7 +1245,17 @@ def copy_sdcard_files(src_drive: str, dest_folder: str, board: str, slot: int, m
                 return False
             src_file = os.path.join(src_drive, f)
             dest_file = os.path.join(dest_folder, f)
-            copy_file_with_progress(src_file, dest_file)
+            file_base = completed_bytes
+            copied = copy_file_with_progress(
+                src_file,
+                dest_file,
+                progress_callback=lambda current, _size, base=file_base: update_copy_progress(
+                    board, slot, base + current, total_bytes
+                ),
+            )
+            if copied:
+                completed_bytes += file_sizes.get(f, 0)
+                update_copy_progress(board, slot, completed_bytes, total_bytes)
 
         for _attempt in range(1, max_passes + 1):
             if CANCEL_EVENT.is_set():
@@ -1160,16 +1263,33 @@ def copy_sdcard_files(src_drive: str, dest_folder: str, board: str, slot: int, m
                 return False
             _, _, missing, mismatched = verify_top_level(src_drive, dest_folder, set(files))
             if not missing and not mismatched:
+                TRACKER.update_phase_fields(board, slot, "copy", {
+                    "copied_bytes": total_bytes,
+                    "total_bytes": total_bytes,
+                    "progress_percent": 100,
+                })
                 mark_and_update(board, slot, "copy", "success", "")
                 return True
             for f in missing + mismatched:
                 src_file = os.path.join(src_drive, f)
                 dest_file = os.path.join(dest_folder, f)
-                copy_file_with_progress(src_file, dest_file)
+                repair_size = file_sizes.get(f, 0)
+                copy_file_with_progress(
+                    src_file,
+                    dest_file,
+                    progress_callback=lambda current, _size, size=repair_size: update_copy_progress(
+                        board, slot, max(0, total_bytes - size) + current, total_bytes
+                    ),
+                )
             time.sleep(0.5)
 
         _, _, missing, mismatched = verify_top_level(src_drive, dest_folder, set(files))
         if not missing and not mismatched:
+            TRACKER.update_phase_fields(board, slot, "copy", {
+                "copied_bytes": total_bytes,
+                "total_bytes": total_bytes,
+                "progress_percent": 100,
+            })
             mark_and_update(board, slot, "copy", "success", "")
             return True
 
@@ -1229,6 +1349,19 @@ def _format_recovery_no_retry(port: str, board: str, slot: int, dl: str) -> None
 BOOT_LOCK = threading.RLock()
 
 # ---------------------------- UF2 BOOT+UPLOAD ----------------------------
+def power_off_slot_before_boot(port: str, board_name: str, slot: int, phase_key: str) -> bool:
+    cmd = power_off_command_for_slot(slot)
+    if not cmd:
+        mark_and_update(board_name, slot, phase_key, "failed", "no power-off command before boot")
+        return False
+    log(f"[{board_name}:{slot}] Pre-boot power-off: sending cmd {cmd}.")
+    resp = send_command(port, cmd)
+    if resp is None:
+        mark_and_update(board_name, slot, phase_key, "failed", f"pre-boot power-off failed: cmd {cmd}")
+        return False
+    time.sleep(0.5)
+    return True
+
 def _boot_and_upload_uf2(port: str, slot: int, uf2_path: str, board_name: str, phase_key: str) -> bool:
     if CANCEL_EVENT.is_set():
         mark_and_update(board_name, slot, phase_key, "failed", "cancelled")
@@ -1242,6 +1375,8 @@ def _boot_and_upload_uf2(port: str, slot: int, uf2_path: str, board_name: str, p
             return False
         if is_board_dead(board_name) or (_norm_port(port) in DEAD_PORTS):
             mark_and_update(board_name, slot, phase_key, "failed", "port/board dead")
+            return False
+        if not power_off_slot_before_boot(port, board_name, slot, phase_key):
             return False
         resp = send_command(port, str(slot))
         if resp is None:
@@ -1258,7 +1393,7 @@ def _boot_and_upload_uf2(port: str, slot: int, uf2_path: str, board_name: str, p
             except Exception as e:
                 mark_and_update(board_name, slot, phase_key, "failed", f"UF2 upload failed: {e}")
                 return False
-    mark_and_update(board_name, slot, phase_key, "failed", "bootloader not detected")
+    mark_and_update(board_name, slot, phase_key, "failed", "boot failed")
     return False
 
 # ---------------------------- PER-SLOT OPS ----------------------------
@@ -1278,7 +1413,7 @@ def op_data_slot(board: str, port: str, expected_slot: int, *, already_in_menu: 
     with BOOT_LOCK:
         ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
         if not ok:
-            mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
+            mark_and_update(board, expected_slot, "copy", "failed", boot_failure_summary(board, expected_slot))
             return False
 
         prefix = get_board_label_prefix(board)
@@ -1287,24 +1422,20 @@ def op_data_slot(board: str, port: str, expected_slot: int, *, already_in_menu: 
         if not sd_drive:
             sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
         if not sd_drive:
-            mark_and_update(board, expected_slot, "copy", "failed", "sd not detected")
+            mark_and_update(board, expected_slot, "copy", "failed", "watchdog reset")
             return False
 
         vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
         parsed = parse_compact_label(vol_label)
-
-        if vol_label:
-            by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
-        else:
-            by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{expected_bidx}S{expected_slot}")
 
         if parsed:
             _, lbl_bidx, lbl_slot = parsed
             t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
         else:
             t_board = board; t_slot = expected_slot
+        by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
 
-    okcopy = copy_sdcard_files(sd_drive, by_label_dir, t_board, t_slot)
+    okcopy = copy_sdcard_files(sd_drive, by_label_dir, board, expected_slot)
 
     if okcopy:
         mark_and_update(board, expected_slot, "copy", "success",
@@ -1332,7 +1463,7 @@ def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_me
     with BOOT_LOCK:
         ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
         if not ok:
-            mark_and_update(board, expected_slot, "copy", "failed", "boot data uf2 failed")
+            mark_and_update(board, expected_slot, "copy", "failed", boot_failure_summary(board, expected_slot))
             return False
 
         prefix = get_board_label_prefix(board)
@@ -1341,22 +1472,18 @@ def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_me
         if not sd_drive:
             sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
         if not sd_drive:
-            mark_and_update(board, expected_slot, "copy", "failed", "sd not detected")
+            mark_and_update(board, expected_slot, "copy", "failed", "watchdog reset")
             return False
 
         vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
         parsed = parse_compact_label(vol_label)
-
-        if vol_label:
-            by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
-        else:
-            by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{expected_bidx}S{expected_slot}")
 
         if parsed:
             _, lbl_bidx, lbl_slot = parsed
             t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
         else:
             t_board = board; t_slot = expected_slot
+        by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
 
     oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
 
@@ -1396,18 +1523,14 @@ def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
     vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
     parsed = parse_compact_label(vol_label)
 
-    if vol_label:
-        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
-    else:
-        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
-
     if parsed:
         _, lbl_bidx, lbl_slot = parsed
         t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
     else:
         t_board = board; t_slot = slot
+    by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
 
-    okcopy = copy_sdcard_files(sd_drive, by_label_dir, t_board, t_slot)
+    okcopy = copy_sdcard_files(sd_drive, by_label_dir, board, slot)
 
     if okcopy:
         mark_and_update(board, slot, "copy", "success",
@@ -1446,16 +1569,12 @@ def op_data_log_pref_slot(board: str, port: str, slot: int) -> bool:
     vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
     parsed = parse_compact_label(vol_label)
 
-    if vol_label:
-        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
-    else:
-        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
-
     if parsed:
         _, lbl_bidx, lbl_slot = parsed
         t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
     else:
         t_board = board; t_slot = slot
+    by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
 
     oklog = log_sdcard_file_info(sd_drive, by_label_dir, t_board, t_slot, vol_label)
 
@@ -1485,12 +1604,12 @@ def op_format_slot(board: str, port: str, slot: int, mode: str, *, already_in_me
     bidx = board_index(board)
     ok = _boot_and_upload_uf2(port, slot, DATA_FIRMWARE, board, "boot_data")
     if not ok:
-        mark_and_update(board, slot, "format", "failed", "boot data uf2 failed")
+        mark_and_update(board, slot, "format", "failed", boot_failure_summary(board, slot))
         disconnect_mux(port, board); return False
 
     sd_drive = wait_for_new_drive(timeout=25, expect_bootloader=False)
     if not sd_drive:
-        mark_and_update(board, slot, "format", "failed", "sd not detected")
+        mark_and_update(board, slot, "format", "failed", "watchdog reset")
         disconnect_mux(port, board); return False
 
     current_label = (get_drive_label(sd_drive.strip("\\")) or "").strip()
@@ -1938,9 +2057,28 @@ def selected_slots_for(board: str, selection: Optional[Dict[str, Set[int]]]) -> 
     slots = [s for s in selection.get(board, set()) if 1 <= int(s) <= lim and int(s) not in excluded]
     return sorted(int(s) for s in slots)
 
+def selected_power_off_slots_for(board: str, selection: Optional[Dict[str, Set[int]]]) -> List[int]:
+    lim = get_slot_limit(board)
+    if lim <= 0:
+        return []
+    valid_slots = {slot for slot in POWER_OFF_SLOT_COMMANDS if slot <= lim}
+    if not selection:
+        return sorted(valid_slots)
+    excluded = BOARD_EXCLUDE_SLOTS.get(board, set())
+    slots = [
+        int(s)
+        for s in selection.get(board, set())
+        if int(s) in valid_slots and int(s) not in excluded
+    ]
+    return sorted(slots)
+
 # ---------------------------- FLOWS ----------------------------
 def _cancelled() -> bool:
     return CANCEL_EVENT.is_set()
+
+def mark_slot_active(board: str, slot: int) -> None:
+    """UI-only marker that a selected slot has been reached for processing."""
+    mark_and_update(board, slot, "active", "running", "")
 
 def process_board_parallel(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
     if _cancelled():
@@ -1959,6 +2097,7 @@ def process_board_parallel(board: str, port: str, selection: Optional[Dict[str, 
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_data_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.4)
         finally:
@@ -1981,6 +2120,7 @@ def process_board_data_log(board: str, port: str, selection: Optional[Dict[str, 
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_data_log_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.4)
         finally:
@@ -1999,6 +2139,7 @@ def process_board_data_preferred(board: str, port: str, selection: Optional[Dict
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_data_pref_slot(board, port, slot)
             time.sleep(0.4)
         finally:
@@ -2017,6 +2158,7 @@ def process_board_data_log_preferred(board: str, port: str, selection: Optional[
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_data_log_pref_slot(board, port, slot)
             time.sleep(0.4)
         finally:
@@ -2039,6 +2181,7 @@ def process_board_format(board: str, port: str, mode: str, selection: Optional[D
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_format_slot(board, port, slot, mode, already_in_menu=True)
             time.sleep(0.25)
         finally:
@@ -2057,6 +2200,7 @@ def process_board_format_preferred(board: str, port: str, selection: Optional[Di
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_format_pref_slot(board, port, slot)
             time.sleep(0.25)
         finally:
@@ -2081,6 +2225,7 @@ def process_board_mfl_all_slots(board: str, port: str, selection: Optional[Dict[
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_mfl_burn_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.25)
         finally:
@@ -2105,6 +2250,7 @@ def process_board_cmfl_all_slots(board: str, port: str, selection: Optional[Dict
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_cmfl_burn_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.25)
         finally:
@@ -2142,6 +2288,7 @@ def process_board_egp_all_slots(board: str, port: str, selection: Optional[Dict[
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_egp_burn_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.25)
         finally:
@@ -2167,6 +2314,7 @@ def process_board_sensor_check_mfl_cmfl(board: str, port: str, selection: Option
         if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
+        mark_slot_active(board, slot)
         op_sensor_check_mfl_cmfl_slot(board, port, slot, already_in_menu=True)
         time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
 
@@ -2189,8 +2337,47 @@ def process_board_sensor_check_egp(board: str, port: str, selection: Optional[Di
         if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
+        mark_slot_active(board, slot)
         op_sensor_check_egp_slot(board, port, slot, already_in_menu=True)
         time.sleep(SENSOR_CHECK_BETWEEN_SLOTS_SECONDS)
+
+def power_off_slots_for(board: str, port: str, slots: List[int]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping power-off.")
+        return
+    if send_command(port, "1") is None:
+        for slot in slots:
+            mark_and_update(board, slot, "power_off", "failed", "slot management menu failed")
+        log(f"[{board}] Could not enter slot management menu for power-off.")
+        return
+    time.sleep(0.5)
+
+    for slot in slots:
+        if _cancelled():
+            mark_and_update(board, slot, "power_off", "failed", "cancelled")
+            break
+        cmd = POWER_OFF_SLOT_COMMANDS.get(int(slot))
+        if not cmd:
+            mark_and_update(board, slot, "power_off", "failed", "no power-off command")
+            continue
+        mark_slot_active(board, slot)
+        resp = send_command(port, cmd)
+        if resp is None:
+            mark_and_update(board, slot, "power_off", "failed", f"serial failed for cmd {cmd}")
+            continue
+        mark_and_update(board, slot, "power_off", "success", f"cmd {cmd}")
+        log(f"[{board}:{slot}] Power-off command sent: {cmd}")
+        time.sleep(0.5)
+
+def process_board_power_off_all_slots(board: str, port: str, selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    slots = selected_power_off_slots_for(board, selection)
+    if not slots:
+        return
+    power_off_slots_for(board, port, slots)
 
 def process_board_auto_format_and_burn(board: str, port: str, selection: Optional[Dict[str, Set[int]]], stagger_seconds: int = 0) -> None:
     if stagger_seconds > 0:
@@ -2233,6 +2420,7 @@ def process_board_label_only(board: str, port: str, selection: Optional[Dict[str
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_label_slot_classic(board, port, slot, already_in_menu=True)
             time.sleep(0.2)
         finally:
@@ -2254,6 +2442,7 @@ def process_board_label_preferred(board: str, port: str, selection: Optional[Dic
             log(f"[{board}] Port dead. Skipping remaining slots.")
             break
         try:
+            mark_slot_active(board, slot)
             op_label_pref_slot(board, port, slot)
             time.sleep(0.2)
         finally:
@@ -2306,6 +2495,7 @@ def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selectio
                         continue
 
                     slot = s["pending"].pop(0)
+                    mark_slot_active(board, slot)
                     if send_command(port, str(slot)) is None:
                         mark_and_update(board, slot, "copy", "failed", "serial open failed (slot connect)")
                         continue
@@ -2328,18 +2518,14 @@ def process_data_pref_pipelined(selected_boards: List[Tuple[str, str]], selectio
                     vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
                     parsed = parse_compact_label(vol_label)
 
-                    if vol_label:
-                        by_label_dir = os.path.join("Extracted_Data", "By_Label", vol_label)
-                    else:
-                        by_label_dir = os.path.join("Extracted_Data", "By_Label", f"UNLABELED_B{bidx}S{slot}")
-
                     if parsed:
                         _, lbl_bidx, lbl_slot = parsed
                         t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
                     else:
                         t_board = board; t_slot = slot
+                    by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
 
-                    fut = pool.submit(copy_sdcard_files, sd_drive, by_label_dir, t_board, t_slot)
+                    fut = pool.submit(copy_sdcard_files, sd_drive, by_label_dir, board, slot)
                     s["current"] = (fut, slot, board, port)
                     last_kick = time.time()
                     started_any = True
@@ -2493,7 +2679,10 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
     elif mode == "CHECK_SENSOR_EGP":
         selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() == "EGP"]
 
-    set_progress_total_from_selected(selected_boards, RUN_SELECTION)
+    if mode == "POWER_OFF_ALL":
+        set_progress_total_for_power_off(selected_boards, RUN_SELECTION)
+    else:
+        set_progress_total_from_selected(selected_boards, RUN_SELECTION)
 
     if not selected_boards and mode not in ("ODO", "INLB"):
         write_summary(mode, board_ports)
@@ -2583,6 +2772,13 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                 process_board_sensor_check_egp(board, port, RUN_SELECTION)
                 time.sleep(0.25)
 
+        elif mode == "POWER_OFF_ALL":
+            for board, port in selected_boards:
+                if CANCEL_EVENT.is_set():
+                    break
+                process_board_power_off_all_slots(board, port, RUN_SELECTION)
+                time.sleep(0.25)
+
         elif mode == "AUTO_FORMAT_BURN":
             items = selected_boards
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
@@ -2656,7 +2852,7 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
 
 # ---------------------------- GUI ----------------------------
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QEvent, QObject, QPropertyAnimation)
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QPainter
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QComboBox, QTableWidget, QTableWidgetItem,
@@ -2682,6 +2878,38 @@ class QtLogBridge(QObject):
         if cls._instance is None:
             cls._instance = QtLogBridge()
         return cls._instance
+
+class RotatingHourglassLabel(QLabel):
+    """Small cell widget that rotates the hourglass glyph itself."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(28, 28)
+
+    def set_angle(self, angle: int) -> None:
+        self._angle = int(angle) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.rotate(self._angle)
+        painter.setPen(QColor("#1d4ed8"))
+        font = self.font()
+        font.setPointSize(max(14, font.pointSize() + 4))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(
+            int(-self.width() / 2),
+            int(-self.height() / 2),
+            self.width(),
+            self.height(),
+            Qt.AlignCenter,
+            "⏳",
+        )
 
 # Serial monitor threads/dialog (Advanced)
 class SerialReaderThread(QThread):
@@ -3484,6 +3712,7 @@ class MainWindow(QMainWindow):
         ("LABEL_PREF", "14. LABEL SLOTS PREFFERED"),
         ("CHECK_SENSOR_MFL_CMFL", "15. CHECK SENSOR VALUES MFL/CMFL"),
         ("CHECK_SENSOR_EGP", "16. CHECK SENSOR VALUES EGP"),
+        ("POWER_OFF_ALL", "17. POWER OFF ALL SLOTS"),
     ]
     BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
 
@@ -3511,7 +3740,10 @@ class MainWindow(QMainWindow):
         self.cancel_btn = QPushButton("Cancel")
         self.finish_odo_btn = QPushButton("Finish ODO")
         self.finish_inlb_btn = QPushButton("Finish INLB")
+        self.new_instance_btn = QPushButton("New Instance")
         self.open_folder_btn = QPushButton("Open Logs Folder")
+        self.new_instance_btn.setToolTip("Open another isolated app window for a different operation.")
+        self.new_instance_btn.setEnabled(False)
         top_row.addWidget(QLabel("Mode:"))
         top_row.addWidget(self.mode_combo)
         top_row.addWidget(self.detect_btn)
@@ -3519,6 +3751,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.cancel_btn)
         top_row.addWidget(self.finish_odo_btn)
         top_row.addWidget(self.finish_inlb_btn)
+        top_row.addWidget(self.new_instance_btn)
         top_row.addStretch(1)
         top_row.addWidget(self.open_folder_btn)
 
@@ -3749,7 +3982,12 @@ class MainWindow(QMainWindow):
 
         # Bottom stats
         self.stats_label = QLabel("Stats: –")
-        bottom = QHBoxLayout(); bottom.addWidget(self.stats_label)
+        self.failed_summary_btn = QPushButton("Show Failed Summary")
+        self.failed_summary_btn.setToolTip("Show failed slots and reasons from the current/last run.")
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.stats_label)
+        bottom.addStretch(1)
+        bottom.addWidget(self.failed_summary_btn)
 
         # Root for advanced page
         adv_container = QWidget(); root = QVBoxLayout(adv_container)
@@ -3770,10 +4008,12 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self.on_cancel)
         self.finish_odo_btn.clicked.connect(self.on_finish_odo)
         self.finish_inlb_btn.clicked.connect(self.on_finish_inlb)
+        self.new_instance_btn.clicked.connect(self.on_launch_additional_instance)
         self.open_folder_btn.clicked.connect(self.on_open_folder)
         self.retry_one_btn.clicked.connect(self.on_retry_one)
         self.retry_extract_btn.clicked.connect(self.on_retry_extraction_failed_from_pref_parallel)
         self.retry_format_btn.clicked.connect(self.on_retry_formatting_failed_from_pref_parallel)
+        self.failed_summary_btn.clicked.connect(self.show_failed_summary_dialog)
         self.rb_all.toggled.connect(self.on_scope_toggle)
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.btn_sel_all.clicked.connect(lambda: self.set_all_selection(True))
@@ -3818,10 +4058,13 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("File")
         act_detect = QAction("Detect Boards", self); act_detect.triggered.connect(self.on_detect)
         act_start = QAction("Start", self); act_start.triggered.connect(self.on_start)
+        self.act_new_instance = QAction("Open Additional Instance", self)
+        self.act_new_instance.triggered.connect(self.on_launch_additional_instance)
+        self.act_new_instance.setEnabled(False)
         act_cancel = QAction("Cancel", self); act_cancel.triggered.connect(self.on_cancel)
         act_open = QAction("Open Logs Folder", self); act_open.triggered.connect(self.on_open_folder)
         act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close)
-        file_menu.addActions([act_detect, act_start, act_cancel, act_open, act_exit])
+        file_menu.addActions([act_detect, act_start, self.act_new_instance, act_cancel, act_open, act_exit])
 
         tools_menu = menubar.addMenu("Tools")
         act_scan_pico = QAction("List Pico Serials", self); act_scan_pico.triggered.connect(self.show_pico_list_dialog)
@@ -3882,6 +4125,7 @@ class MainWindow(QMainWindow):
         self.ez_on_scope_toggle()
 
     def on_ez_action(self, mode: str) -> None:
+        global MODE_CURRENT, RUN_SELECTION
         if self.engine_thread and self.engine_thread.isRunning():
             QMessageBox.warning(self, "Busy", "A run is already in progress.")
             return
@@ -3899,6 +4143,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Selection", "No boards/slots selected."); return
 
         start_new_run_reset()
+        MODE_CURRENT = mode
+        RUN_SELECTION = selection or None
         self.reset_progress_model()
         self.refresh_views(force_clear=True)
         self.toggle_controls(False)
@@ -3949,6 +4195,7 @@ class MainWindow(QMainWindow):
         self.ez_btn_upload = QPushButton("UPLOAD CODE")
         self.ez_btn_sensor_mfl = QPushButton("CHECK SENSOR VALUES MFL/CMFL")
         self.ez_btn_sensor_egp = QPushButton("CHECK SENSOR VALUES EGP")
+        self.ez_btn_power_off = QPushButton("POWER OFF ALL SLOTS")
         self.ez_btn_odo = QPushButton("CONNECT ODOMETER TO PC")
         self.ez_btn_inlb = QPushButton("CONNECT INLB TO PC")
         buttons = [
@@ -3957,6 +4204,7 @@ class MainWindow(QMainWindow):
             self.ez_btn_upload,
             self.ez_btn_sensor_mfl,
             self.ez_btn_sensor_egp,
+            self.ez_btn_power_off,
             self.ez_btn_odo,
             self.ez_btn_inlb,
         ]
@@ -3974,11 +4222,15 @@ class MainWindow(QMainWindow):
         self.ez_start_btn = QPushButton("Start")
         self.ez_start_btn.hide()  # start handled by action buttons
         self.ez_cancel_btn = QPushButton("ABORT")
+        self.ez_new_instance_btn = QPushButton("NEW INSTANCE")
+        self.ez_new_instance_btn.setToolTip("Open another isolated app window for a different operation.")
+        self.ez_new_instance_btn.setEnabled(False)
         self.ez_open_logs_btn = QPushButton("OPEN LOGS FOLDER")
-        for b in (self.ez_detect_btn, self.ez_open_logs_btn, self.ez_cancel_btn):
+        for b in (self.ez_detect_btn, self.ez_open_logs_btn, self.ez_cancel_btn, self.ez_new_instance_btn):
             b.setMinimumWidth(160)
         ctrl_row.addWidget(self.ez_detect_btn)
         ctrl_row.addWidget(self.ez_open_logs_btn)
+        ctrl_row.addWidget(self.ez_new_instance_btn)
         ctrl_row.addWidget(self.ez_cancel_btn)
         ctrl_row.addStretch(1)
 
@@ -4122,6 +4374,7 @@ class MainWindow(QMainWindow):
 
         self.ez_detect_btn.clicked.connect(self.on_ez_detect)
         self.ez_cancel_btn.clicked.connect(self.on_cancel)
+        self.ez_new_instance_btn.clicked.connect(self.on_launch_additional_instance)
         self.ez_open_logs_btn.clicked.connect(self.on_open_folder)
         self.ez_rb_all.toggled.connect(self.ez_on_scope_toggle)
         self.ez_rb_custom.toggled.connect(self.ez_on_scope_toggle)
@@ -4135,6 +4388,7 @@ class MainWindow(QMainWindow):
         self.ez_btn_upload.clicked.connect(lambda: self.on_ez_action("UPLOAD_CODE"))
         self.ez_btn_sensor_mfl.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_MFL_CMFL"))
         self.ez_btn_sensor_egp.clicked.connect(lambda: self.on_ez_action("CHECK_SENSOR_EGP"))
+        self.ez_btn_power_off.clicked.connect(lambda: self.on_ez_action("POWER_OFF_ALL"))
         self.ez_btn_odo.clicked.connect(lambda: self.on_ez_action("ODO"))
         self.ez_btn_inlb.clicked.connect(lambda: self.on_ez_action("INLB"))
         self.btn_scope_dialog.clicked.connect(self.on_open_scope_dialog)
@@ -4342,6 +4596,7 @@ class MainWindow(QMainWindow):
         self._highlight_registry_matches(self.reg_table, DETECTED_SERIALS_CURRENT)
 
     def on_start(self) -> None:
+        global MODE_CURRENT, RUN_SELECTION
         if self.engine_thread and self.engine_thread.isRunning():
             QMessageBox.warning(self, "Busy", "A run is already in progress.")
             return
@@ -4363,6 +4618,8 @@ class MainWindow(QMainWindow):
 
         # Fresh status/summary at each start
         start_new_run_reset()
+        MODE_CURRENT = mode
+        RUN_SELECTION = selection or None
         self.reset_progress_model()
         self.refresh_views(force_clear=True)
 
@@ -4393,6 +4650,7 @@ class MainWindow(QMainWindow):
         self.refresh_views()
         self.load_simple_log()
         self.refresh_progress(finalize=True)
+        self.show_failed_summary_dialog(auto=True)
 
     def on_engine_failed(self, err: str) -> None:
         self.toggle_controls(True)
@@ -4400,7 +4658,87 @@ class MainWindow(QMainWindow):
         self.refresh_views()
         self.load_simple_log()
         self.refresh_progress(finalize=True)
+        self.show_failed_summary_dialog(auto=True, engine_error=err)
         QMessageBox.critical(self, "Run Failed", f"Engine error:\n{err}")
+
+    def build_failed_summary_text(self, engine_error: str = "") -> str:
+        mode = MODE_CURRENT or self.mode_combo.currentData() or ""
+        snap = TRACKER.snapshot()
+        failures: List[Tuple[str, int, str]] = []
+        for board, slots in snap.items():
+            for slot_text, phases in slots.items():
+                reasons = [
+                    f"{phase}: {rec.get('err') or 'failed'}"
+                    for phase, rec in (phases or {}).items()
+                    if (rec or {}).get("status") == "failed"
+                ]
+                if not reasons:
+                    continue
+                try:
+                    slot_no = int(slot_text)
+                except Exception:
+                    slot_no = 0
+                failures.append((board, slot_no, "; ".join(reasons)))
+
+        lines: List[str] = []
+        if engine_error:
+            lines.append(f"Engine error: {engine_error}")
+            lines.append("")
+        lines.append(f"Mode: {mode or 'Unknown'}")
+        lines.append(f"Failures: {len(failures)}")
+        lines.append("")
+
+        if not failures:
+            lines.append("No failed slots.")
+            return "\n".join(lines)
+
+        for board, slot, reason in failures:
+            slot_label = f"S{slot}" if int(slot or 0) > 0 else "board-level"
+            lines.append(f"- {board} {slot_label}: {reason}")
+        return "\n".join(lines)
+
+    def show_failed_summary_dialog(self, auto: bool = False, engine_error: str = "") -> None:
+        text = self.build_failed_summary_text(engine_error)
+        if auto and "No failed slots." in text and not engine_error:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Failed Summary")
+        dlg.resize(720, 420)
+        layout = QVBoxLayout(dlg)
+        title = QLabel("Failed Summary")
+        title.setStyleSheet("font-weight: 700; font-size: 16px;")
+        layout.addWidget(title)
+        box = QTextEdit()
+        box.setReadOnly(True)
+        box.setPlainText(text)
+        layout.addWidget(box, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        dlg.exec_()
+
+    def on_launch_additional_instance(self) -> None:
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable]
+                cwd = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                script_path = os.path.abspath(__file__)
+                cmd = [sys.executable, script_path]
+                cwd = os.path.dirname(script_path)
+
+            creationflags = 0
+            if sys.platform.startswith("win"):
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                close_fds=True,
+                creationflags=creationflags,
+            )
+            log("[INSTANCE] Launched additional isolated app instance.")
+        except Exception as e:
+            QMessageBox.warning(self, "New Instance", f"Failed to launch another instance:\n{e}")
 
     def on_open_folder(self) -> None:
         try:
@@ -4758,12 +5096,18 @@ class MainWindow(QMainWindow):
 
     # UI helpers
     def toggle_controls(self, enabled: bool) -> None:
+        run_active = not enabled
         self.mode_combo.setEnabled(enabled)
         self.detect_btn.setEnabled(enabled)
         self.start_btn.setEnabled(enabled)
         self.cancel_btn.setEnabled(not enabled or True)  # cancel stays enabled during run
         self.finish_odo_btn.setEnabled(enabled)
         self.finish_inlb_btn.setEnabled(enabled)
+        self.new_instance_btn.setEnabled(run_active)
+        try:
+            self.act_new_instance.setEnabled(run_active)
+        except Exception:
+            pass
         self.rb_all.setEnabled(enabled)
         self.rb_custom.setEnabled(enabled)
         self.on_scope_toggle()
@@ -4779,12 +5123,14 @@ class MainWindow(QMainWindow):
         try:
             self.ez_detect_btn.setEnabled(enabled)
             self.ez_cancel_btn.setEnabled(not enabled or True)
+            self.ez_new_instance_btn.setEnabled(not enabled)
             for btn in (
                 self.ez_btn_extract,
                 self.ez_btn_format,
                 self.ez_btn_upload,
                 self.ez_btn_sensor_mfl,
                 self.ez_btn_sensor_egp,
+                self.ez_btn_power_off,
                 self.ez_btn_odo,
                 self.ez_btn_inlb,
             ):
@@ -4821,7 +5167,11 @@ class MainWindow(QMainWindow):
 
     def _setup_progress_table(self, table: QTableWidget) -> None:
         table.setRowCount(len(self._board_order))
+        table.setWordWrap(True)
+        table.horizontalHeader().setMinimumSectionSize(64)
+        table.verticalHeader().setMinimumSectionSize(38)
         for r, b in enumerate(self._board_order):
+            table.setRowHeight(r, 38)
             table.setVerticalHeaderItem(r, QTableWidgetItem(f"{b} [{get_board_type(b)}]"))
             lim = get_slot_limit(b)
             excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
@@ -4832,9 +5182,15 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(sym)
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(r, c, item)
-        table.resizeColumnsToContents()
+        try:
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        except Exception:
+            table.resizeColumnsToContents()
 
     def _refresh_progress_table(self, table: QTableWidget, snap: Dict[str, Dict], mode: Optional[str]) -> None:
+        is_extraction = (mode or "") in ("DATA", "DATA_PREF")
+        run_has_started = MODE_CURRENT is not None or bool(snap)
+        spinner_angle = int((time.time() * 240) % 360)
         for r, b in enumerate(self._board_order):
             lim = get_slot_limit(b)
             excluded = BOARD_EXCLUDE_SLOTS.get(b, set())
@@ -4842,28 +5198,148 @@ class MainWindow(QMainWindow):
             for c in range(8):
                 item = table.item(r, c)
                 if c >= lim:
+                    table.removeCellWidget(r, c)
                     if item: item.setText("–")
                     continue
                 if (c+1) in excluded:
+                    table.removeCellWidget(r, c)
                     if item: item.setText("×")
                     continue
                 slot = c+1
                 phases = phases_by_slot.get(str(slot), {})
+                copy_rec = phases.get("copy", {}) or {}
+                if not run_has_started:
+                    table.removeCellWidget(r, c)
+                    if item is None:
+                        item = QTableWidgetItem("⏳")
+                        table.setItem(r, c, item)
+                    else:
+                        item.setText("⏳")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setForeground(QColor("#111827"))
+                    item.setToolTip("Waiting")
+                    continue
+
+                selected_for_run = is_slot_selected_for_current_run(b, slot)
+                if not selected_for_run:
+                    table.removeCellWidget(r, c)
+                    if item is None:
+                        item = QTableWidgetItem("NA")
+                        table.setItem(r, c, item)
+                    else:
+                        item.setText("NA")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setToolTip("Not selected for this run")
+                    item.setForeground(QColor("#6b7280"))
+                    continue
+
+                if is_extraction:
+                    status = copy_rec.get("status", "pending")
+                    slot_reached = bool(phases)
+                    if not slot_reached:
+                        spinner = table.cellWidget(r, c)
+                        if not isinstance(spinner, RotatingHourglassLabel):
+                            spinner = RotatingHourglassLabel(table)
+                            table.setCellWidget(r, c, spinner)
+                        spinner.set_angle(0)
+                        spinner.setToolTip("Waiting to start extraction")
+                        if item:
+                            item.setText("")
+                        continue
+
+                    percent = extraction_percent(
+                        copy_rec.get("copied_bytes", 0),
+                        copy_rec.get("total_bytes", 0),
+                        complete=copy_rec.get("status") == "success",
+                    )
+                    bar = table.cellWidget(r, c)
+                    if not isinstance(bar, QProgressBar):
+                        bar = QProgressBar(table)
+                        bar.setRange(0, 100)
+                        bar.setAlignment(Qt.AlignCenter)
+                        bar.setTextVisible(True)
+                        table.setCellWidget(r, c, bar)
+                    bar.setValue(percent)
+                    eta_seconds = estimate_eta_seconds(
+                        copy_rec.get("copied_bytes", 0),
+                        copy_rec.get("total_bytes", 0),
+                        copy_rec.get("copy_started_at"),
+                        time.time(),
+                    )
+                    eta_text = format_eta(eta_seconds)
+                    if status == "failed":
+                        bar.setFormat(f"{percent}% Failed")
+                        bar.setStyleSheet(
+                            "QProgressBar{border:1px solid #fecaca;border-radius:5px;"
+                            "background:#fff7f7;color:#7f1d1d;text-align:center;font-weight:700;}"
+                            "QProgressBar::chunk{background:#fca5a5;border-radius:4px;}"
+                        )
+                        bar.setToolTip(copy_rec.get("err") or f"Extraction failed | {eta_text}")
+                    elif status == "success":
+                        bar.setFormat("100%")
+                        bar.setStyleSheet(
+                            "QProgressBar{border:1px solid #bbf7d0;border-radius:5px;"
+                            "background:#f7fef9;color:#14532d;text-align:center;font-weight:700;}"
+                            "QProgressBar::chunk{background:#86efac;border-radius:4px;}"
+                        )
+                        bar.setToolTip("Extraction copied and verified")
+                    else:
+                        bar.setFormat(f"{percent}%")
+                        bar.setStyleSheet(
+                            "QProgressBar{border:1px solid #bfdbfe;border-radius:5px;"
+                            "background:#f8fbff;color:#172554;text-align:center;font-weight:700;}"
+                            "QProgressBar::chunk{background:#93c5fd;border-radius:4px;}"
+                        )
+                        if copy_rec:
+                            bar.setToolTip(
+                                f"{copy_rec.get('copied_bytes', 0):,} / "
+                                f"{copy_rec.get('total_bytes', 0):,} bytes | {eta_text}"
+                            )
+                        else:
+                            bar.setToolTip("Waiting to start extraction")
+                    if item:
+                        item.setText("")
+                    continue
+
                 sym = "⏳"
+                tooltip = "Waiting"
+                show_hourglass = True
+                rotate_hourglass = False
                 if phases:
                     if StatusTracker.slot_done(mode or "", phases):
                         sym = "✅"
+                        tooltip = "Completed"
+                        show_hourglass = False
                     elif any(rec.get("status") == "failed" for rec in phases.values()):
                         sym = "❌"
+                        tooltip = next(
+                            (rec.get("err") for rec in phases.values() if rec.get("status") == "failed"),
+                            "Failed",
+                        )
+                        show_hourglass = False
                     elif any(rec.get("status") == "running" for rec in phases.values()):
-                        sym = "⏳"
+                        tooltip = "Running"
+                        rotate_hourglass = True
+                if show_hourglass:
+                    spinner = table.cellWidget(r, c)
+                    if not isinstance(spinner, RotatingHourglassLabel):
+                        spinner = RotatingHourglassLabel(table)
+                        table.setCellWidget(r, c, spinner)
+                    spinner.set_angle(spinner_angle if rotate_hourglass else 0)
+                    spinner.setToolTip(str(tooltip))
+                    if item:
+                        item.setText("")
+                    continue
+
+                table.removeCellWidget(r, c)
                 if item is None:
                     item = QTableWidgetItem(sym)
                     table.setItem(r, c, item)
                 else:
                     item.setText(sym)
                 item.setTextAlignment(Qt.AlignCenter)
-        table.resizeColumnsToContents()
+                item.setForeground(QColor("#111827"))
+                item.setToolTip(str(tooltip))
 
     def _rebuild_progress_tables(self) -> None:
         self._setup_progress_table(self.table)
