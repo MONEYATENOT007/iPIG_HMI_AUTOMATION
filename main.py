@@ -21,6 +21,7 @@ import atexit
 import traceback
 from datetime import datetime
 import re
+import struct
 from typing import Callable, Optional, Dict, Set, List, Tuple
 
 from extraction_paths import build_by_label_destination
@@ -47,7 +48,7 @@ def load_registry() -> Dict[str, Dict]:
         pass
     return {"version": 4, "serial_to_board": {}}  # v2 adds "exclude", v3 adds "pipe_size", v4 adds "total_slots"
 
-def save_registry(reg: Dict[str, Dict]) -> None:
+def save_registry(reg: Dict[str, Dict]):
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
@@ -66,7 +67,7 @@ def save_registry(reg: Dict[str, Dict]) -> None:
         os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         print(f"[WARN] Failed to save registry: {e}", flush=True)
-
+    return None
 REGISTRY = load_registry()
 
 # ---------------------------- RESOURCES ----------------------------
@@ -146,6 +147,7 @@ MT_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*mT\b", re.IGNORECASE)
 ANGLE_VALUE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:\u00b0|deg(?:ree)?s?)", re.IGNORECASE)
 
 PROG_TOTAL_SLOTS = 0
+# Completed slots, stored as (board name, slot number) pairs.
 PROG_SLOTS_DONE: Set[Tuple[str, int]] = set()
 
 # Dead ports/boards (with 5s grace on first failure)
@@ -250,7 +252,7 @@ class StatusTracker:
     @staticmethod
     def slot_done(option_mode: str, phases: Dict[str, Dict[str, str]]) -> bool:
         g = lambda k: (phases.get(k, {}) or {}).get("status", "")
-        if option_mode in ("DATA", "DATA_PREF", "DATA_LOG", "DATA_LOG_PREF"):
+        if option_mode in ("DATA", "DATA_PREF", "DATA_LOG", "DATA_LOG_PREF", "EXPRESS_REPORT"):
             return g("copy") == "success"
         if option_mode in ("MFL", "MFL_PREF"):
             return g("format") == "success"
@@ -1116,7 +1118,15 @@ def copy_file_with_progress(
     log(f"[ERROR] Failed to copy {src}")
     return False
 
-def log_sdcard_file_info(src_drive: str, dest_folder: str, board: str, slot: int, vol_label: str) -> bool:
+EXPRESS_SAMPLE_INTERVAL = 1024 * 1024
+EXPRESS_SECTOR_SIZE = 512
+EXPRESS_FRAME_SIZES = {"A-MFL": 64, "C-MFL": 64, "EGP": 112}
+EXPRESS_REPORT_SUBFOLDER = "Express Report"
+LOG_SUMMARY_SUBFOLDER = "Log Summary"
+
+def log_sdcard_file_info(src_drive: str, dest_folder: str, board: str,
+                         slot: int, vol_label: str) -> bool:
+    """Write the original DATA_LOG filename-and-size summary."""
     try:
         if CANCEL_EVENT.is_set():
             return False
@@ -1130,23 +1140,188 @@ def log_sdcard_file_info(src_drive: str, dest_folder: str, board: str, slot: int
         os.makedirs(dest_folder, exist_ok=True)
         log_path = os.path.join(dest_folder, "data_log.txt")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(
+        with open(log_path, "a", encoding="utf-8") as output:
+            output.write(
                 f"=== DATA LOG | board={board} slot={slot} | "
                 f"label={vol_label or 'UNKNOWN'} | drive={src_drive} | time={ts} ===\n"
             )
-            for name in sorted(file_map.keys()):
+            for name in sorted(file_map):
                 size = file_map.get(name, -1)
                 if size is None or size < 0:
-                    f.write(f"{name} | size=unknown\n")
+                    output.write(f"{name} | size=unknown\n")
                 else:
-                    f.write(f"{name} | {size} bytes\n")
-            f.write("\n")
+                    output.write(f"{name} | {size} bytes\n")
+            output.write("\n")
         log(f"[LOGGED] {board} slot {slot} | {len(file_map)} files from {src_drive} -> {log_path}")
         return True
     except Exception as e:
         log(f"[ERROR] Failed to write data log for {board}:{slot}: {e}")
         return False
+
+def _express_frame_size(board: str) -> int:
+    """Return the on-card packet size for a configured hub board."""
+    return EXPRESS_FRAME_SIZES.get(get_board_type(board).upper(), 64)
+
+def express_sample_offsets(file_size: int, frame_size: int,
+                           interval: int = EXPRESS_SAMPLE_INTERVAL) -> List[int]:
+    """Choose one complete, frame-aligned packet at every interval boundary."""
+    if file_size < frame_size or frame_size <= 0 or interval <= 0:
+        return []
+    last_start = file_size - frame_size
+    return [min((boundary // frame_size) * frame_size, last_start)
+            for boundary in range(0, file_size, interval)]
+
+def _read_uncached_windows(path: str, requests: List[Tuple[int, int]],
+                           sector_size: int = EXPRESS_SECTOR_SIZE) -> List[bytes]:
+    """Read ranges through aligned, unbuffered Win32 I/O (no Windows file cache)."""
+    kernel32 = ctypes.windll.kernel32
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    create_file.restype = ctypes.c_void_p
+    kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                      ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    kernel32.VirtualFree.restype = ctypes.c_int
+    kernel32.SetFilePointerEx.argtypes = [ctypes.c_void_p, ctypes.c_longlong,
+                                         ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.SetFilePointerEx.restype = ctypes.c_int
+    kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                  ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    kernel32.ReadFile.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = create_file(path, 0x80000000, 0x00000001 | 0x00000002, None, 3,
+                         0x20000000 | 0x08000000, None)  # NO_BUFFERING | SEQUENTIAL_SCAN
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        raise ctypes.WinError(ctypes.get_last_error())
+    allocation = None
+    try:
+        max_length = max((offset % sector_size) + length for offset, length in requests)
+        read_size = ((max_length + sector_size - 1) // sector_size) * sector_size
+        allocation = kernel32.VirtualAlloc(None, read_size, 0x1000 | 0x2000, 0x04)
+        if not allocation:
+            raise ctypes.WinError(ctypes.get_last_error())
+        out: List[bytes] = []
+        for offset, length in requests:
+            aligned_offset = (offset // sector_size) * sector_size
+            if not kernel32.SetFilePointerEx(handle, ctypes.c_longlong(aligned_offset), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            read = ctypes.c_uint32()
+            if not kernel32.ReadFile(handle, allocation, read_size, ctypes.byref(read), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            within = offset - aligned_offset
+            if read.value < within + length:
+                raise IOError(f"short unbuffered read at offset {offset}")
+            out.append(ctypes.string_at(int(allocation) + within, length))
+        return out
+    finally:
+        if allocation:
+            kernel32.VirtualFree(allocation, 0, 0x8000)
+        kernel32.CloseHandle(handle)
+
+def read_express_samples(path: str, offsets: List[int], frame_size: int) -> List[bytes]:
+    requests = [(offset, frame_size) for offset in offsets]
+    if not requests:
+        return []
+    if os.name == "nt":
+        return _read_uncached_windows(os.path.abspath(path), requests)
+    # Test/development fallback. Production extraction runs on Windows.
+    with open(path, "rb", buffering=0) as source:
+        packets = []
+        for offset in offsets:
+            source.seek(offset)
+            packet = source.read(frame_size)
+            if len(packet) != frame_size:
+                raise IOError(f"short read at offset {offset}")
+            packets.append(packet)
+        return packets
+
+def extract_express_report_samples(src_drive: str, dest_folder: str, board: str,
+                                   slot: int, vol_label: str) -> bool:
+    """Extract one complete binary packet per MiB and write an audit manifest."""
+    try:
+        if CANCEL_EVENT.is_set():
+            return False
+        if not os.path.exists(src_drive):
+            log(f"[EXPRESS {board}:{slot}] Drive {src_drive} not found.")
+            return False
+        file_map = top_level_file_map(src_drive)
+        if not file_map:
+            log(f"[EXPRESS {board}:{slot}] No files found on {src_drive}.")
+            return False
+        os.makedirs(dest_folder, exist_ok=True)
+        frame_size = _express_frame_size(board)
+        manifest = {
+            "format": "PIG Express Report samples v1", "created_at": datetime.now().isoformat(),
+            "board": board, "slot": slot, "label": vol_label or "UNKNOWN",
+            "sample_interval_bytes": EXPRESS_SAMPLE_INTERVAL, "frame_size": frame_size,
+            "read_mode": "unbuffered-sector" if os.name == "nt" else "unbuffered-file",
+            "files": [],
+        }
+        for name in sorted(file_map):
+            if CANCEL_EVENT.is_set():
+                return False
+            size = file_map[name]
+            if size is None or size < frame_size:
+                continue
+            source_path = os.path.join(src_drive, name)
+            offsets = express_sample_offsets(size, frame_size)
+            packets = read_express_samples(source_path, offsets, frame_size)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+            output_name = safe_name + ".express.bin"
+            output_path = os.path.join(dest_folder, output_name)
+            with open(output_path, "wb") as output:
+                output.write(b"PIGX")
+                output.write(struct.pack("<HHQI", 1, frame_size, size, len(packets)))
+                for offset, packet in zip(offsets, packets):
+                    output.write(struct.pack("<Q", offset))
+                    output.write(packet)
+            manifest["files"].append({"source": name, "source_size": size,
+                                      "output": output_name, "sample_offsets": offsets})
+        if not manifest["files"]:
+            log(f"[EXPRESS {board}:{slot}] No complete packets were available.")
+            return False
+        manifest_path = os.path.join(dest_folder, "express_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as output:
+            json.dump(manifest, output, indent=2)
+        log(f"[EXPRESS] {board} slot {slot} | sampled {len(manifest['files'])} files -> {dest_folder}")
+        return True
+    except Exception as e:
+        log(f"[ERROR] Express extraction failed for {board}:{slot}: {e}")
+        return False
+
+def extract_express_report_package(src_drive: str, dest_folder: str, board: str,
+                                   slot: int, vol_label: str) -> bool:
+    """Create separate log-summary and sampled-data folders for Express Report."""
+    log_summary_dir = os.path.join(dest_folder, LOG_SUMMARY_SUBFOLDER)
+    express_report_dir = os.path.join(dest_folder, EXPRESS_REPORT_SUBFOLDER)
+
+    log_ok = log_sdcard_file_info(
+        src_drive, log_summary_dir, board, slot, vol_label
+    )
+    if CANCEL_EVENT.is_set():
+        return False
+    express_ok = extract_express_report_samples(
+        src_drive, express_report_dir, board, slot, vol_label
+    )
+
+    if log_ok and express_ok:
+        log(
+            f"[EXPRESS PACKAGE] {board} slot {slot} -> "
+            f"{log_summary_dir} + {express_report_dir}"
+        )
+        return True
+
+    failed_parts = []
+    if not log_ok:
+        failed_parts.append("log summary")
+    if not express_ok:
+        failed_parts.append("Express samples")
+    log(f"[ERROR] Express package failed for {board}:{slot}: {', '.join(failed_parts)}")
+    return False
 
 def top_level_file_map(root_path: str) -> Dict[str, int]:
     try:
@@ -1496,6 +1671,59 @@ def op_data_log_slot(board: str, port: str, expected_slot: int, *, already_in_me
 
     disconnect_mux(port, board)
     return bool(oklog)
+
+def op_express_report_slot(board: str, port: str, expected_slot: int,
+                           *, already_in_menu: bool = False) -> bool:
+    if CANCEL_EVENT.is_set():
+        mark_and_update(board, expected_slot, "copy", "failed", "cancelled")
+        return False
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        mark_and_update(board, expected_slot, "copy", "failed", "port/board dead")
+        return False
+    if not already_in_menu:
+        if send_command(port, "1") is None:
+            mark_and_update(board, expected_slot, "copy", "failed", "serial open failed")
+            return False
+        time.sleep(0.5)
+    expected_bidx = board_index(board)
+    with BOOT_LOCK:
+        ok = _boot_and_upload_uf2(port, expected_slot, DATA_FIRMWARE, board, "boot_data")
+        if not ok:
+            mark_and_update(board, expected_slot, "copy", "failed", boot_failure_summary(board, expected_slot))
+            return False
+
+        prefix = get_board_label_prefix(board)
+        expected_label = build_label(prefix, expected_bidx, expected_slot)
+        sd_drive = wait_for_drive_by_label([expected_label], timeout=30)
+        if not sd_drive:
+            sd_drive = wait_for_new_drive(timeout=30, expect_bootloader=False)
+        if not sd_drive:
+            mark_and_update(board, expected_slot, "copy", "failed", "watchdog reset")
+            return False
+
+        vol_label = (get_drive_label(sd_drive.strip("\\")) or "").strip().upper()
+        parsed = parse_compact_label(vol_label)
+
+        if parsed:
+            _, lbl_bidx, lbl_slot = parsed
+            t_board = find_board_name_by_index(lbl_bidx); t_slot = lbl_slot
+        else:
+            t_board = board; t_slot = expected_slot
+        by_label_dir = get_extraction_destination(t_board, t_slot, vol_label)
+
+    ok_package = extract_express_report_package(
+        sd_drive, by_label_dir, t_board, t_slot, vol_label
+    )
+
+    if ok_package:
+        mark_and_update(board, expected_slot, "copy", "success",
+                        f"Express package via label '{vol_label or 'UNKNOWN'}' -> {t_board}:{t_slot}")
+    else:
+        mark_and_update(board, expected_slot, "copy", "failed",
+                        f"Express package failed; label '{vol_label or 'UNKNOWN'}' mapped to {t_board}:{t_slot}")
+
+    disconnect_mux(port, board)
+    return bool(ok_package)
 
 def op_data_pref_slot(board: str, port: str, slot: int) -> bool:
     if CANCEL_EVENT.is_set():
@@ -2007,6 +2235,8 @@ def retry_single(board_name: str, slot: int, mode: str) -> bool:
             return op_data_slot(board_name, port, slot)
         if mode == "DATA_LOG":
             return op_data_log_slot(board_name, port, slot)
+        if mode == "EXPRESS_REPORT":
+            return op_express_report_slot(board_name, port, slot)
         if mode == "DATA_PREF":
             return op_data_pref_slot(board_name, port, slot)
         if mode == "DATA_LOG_PREF":
@@ -2122,6 +2352,30 @@ def process_board_data_log(board: str, port: str, selection: Optional[Dict[str, 
         try:
             mark_slot_active(board, slot)
             op_data_log_slot(board, port, slot, already_in_menu=True)
+            time.sleep(0.4)
+        finally:
+            pass
+
+def process_board_express_report(board: str, port: str,
+                                 selection: Optional[Dict[str, Set[int]]]) -> None:
+    if _cancelled():
+        return
+    if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+        log(f"[{board}] Port dead. Skipping board.")
+        return
+    if send_command(port, "1") is None:
+        log(f"[{board}] Could not enter slot menu; skipping board.")
+        return
+    time.sleep(0.5)
+    for slot in selected_slots_for(board, selection):
+        if _cancelled():
+            break
+        if is_board_dead(board) or (_norm_port(port) in DEAD_PORTS):
+            log(f"[{board}] Port dead. Skipping remaining slots.")
+            break
+        try:
+            mark_slot_active(board, slot)
+            op_express_report_slot(board, port, slot, already_in_menu=True)
             time.sleep(0.4)
         finally:
             pass
@@ -2674,7 +2928,12 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
     selected_boards = list(board_ports.items())
     if RUN_SELECTION:
         selected_boards = [(b, p) for b, p in selected_boards if selected_slots_for(b, RUN_SELECTION)]
-    if mode == "CHECK_SENSOR_MFL_CMFL":
+    if mode in ("DATA_LOG", "DATA_LOG_PREF", "EXPRESS_REPORT"):
+        # These modes operate on hub slots. Express Report handles ODO and INLB
+        # separately through their dedicated serial sequences below.
+        selected_boards = [(b, p) for b, p in selected_boards
+                           if selected_slots_for(b, RUN_SELECTION)]
+    elif mode == "CHECK_SENSOR_MFL_CMFL":
         selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() != "EGP"]
     elif mode == "CHECK_SENSOR_EGP":
         selected_boards = [(b, p) for b, p in selected_boards if get_board_type(b).upper() == "EGP"]
@@ -2684,7 +2943,7 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
     else:
         set_progress_total_from_selected(selected_boards, RUN_SELECTION)
 
-    if not selected_boards and mode not in ("ODO", "INLB"):
+    if not selected_boards and mode not in ("ODO", "INLB", "EXPRESS_REPORT"):
         write_summary(mode, board_ports)
         return
 
@@ -2712,6 +2971,23 @@ def process_all_boards_with_selection(mode: str, selection: Optional[Dict[str, S
                         f.result()
                     except Exception as e:
                         log(f"[ERROR] Worker crashed: {e}")
+
+        elif mode == "EXPRESS_REPORT":
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_boards)))) as executor:
+                futures = [executor.submit(process_board_express_report, b, p, RUN_SELECTION)
+                           for b, p in selected_boards]
+                for f in as_completed(futures):
+                    if CANCEL_EVENT.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log(f"[ERROR] Express Report worker crashed: {e}")
+            # Express Report packages also require the auxiliary navigation data.
+            if not CANCEL_EVENT.is_set():
+                process_odo_extraction()
+            if not CANCEL_EVENT.is_set():
+                process_inlb_extraction()
 
         elif mode == "DATA_PREF":
             process_data_pref_pipelined(selected_boards, RUN_SELECTION, kick_gap_sec=2.0)
@@ -3713,6 +3989,7 @@ class MainWindow(QMainWindow):
         ("CHECK_SENSOR_MFL_CMFL", "15. CHECK SENSOR VALUES MFL/CMFL"),
         ("CHECK_SENSOR_EGP", "16. CHECK SENSOR VALUES EGP"),
         ("POWER_OFF_ALL", "17. POWER OFF ALL SLOTS"),
+        ("EXPRESS_REPORT", "18. EXPRESS REPORT EXTRACTION"),
     ]
     BOARD_TYPES = ["A-MFL", "C-MFL", "EGP"]
 
@@ -5413,12 +5690,13 @@ class MainWindow(QMainWindow):
 # ---------------------------- CLI ----------------------------
 def main_cli() -> None:
     print("CLI runs on all registry-detected boards/slots.")
-    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF,15=CHECK_SENSOR_MFL_CMFL,16=CHECK_SENSOR_EGP): ").strip()
+    choice = input("Select option (1=DATA,2=MFL,3=MFL_ALL_SLOTS,4=CMFL_ALL_SLOTS,5=LABEL,6=EGP_ALL_SLOTS,7=AUTO_FORMAT_BURN_EGP,8=DATA_PREF,9=MFL_PREF,10=ODO,11=INLB,12=DATA_LOG,13=DATA_LOG_PREF,14=LABEL_PREF,15=CHECK_SENSOR_MFL_CMFL,16=CHECK_SENSOR_EGP,17=POWER_OFF_ALL,18=EXPRESS_REPORT): ").strip()
     opt_map = {
         "1":"DATA","2":"MFL","3":"MFL_ALL_SLOTS","4":"CMFL_ALL_SLOTS",
         "5":"LABEL","6":"EGP_ALL_SLOTS","7":"AUTO_FORMAT_BURN_EGP","8":"DATA_PREF","9":"MFL_PREF",
         "10":"ODO","11":"INLB","12":"DATA_LOG","13":"DATA_LOG_PREF","14":"LABEL_PREF",
-        "15":"CHECK_SENSOR_MFL_CMFL","16":"CHECK_SENSOR_EGP"
+        "15":"CHECK_SENSOR_MFL_CMFL","16":"CHECK_SENSOR_EGP",
+        "17":"POWER_OFF_ALL","18":"EXPRESS_REPORT"
     }
     mode = opt_map.get(choice, "INVALID")
     if mode == "INVALID":
